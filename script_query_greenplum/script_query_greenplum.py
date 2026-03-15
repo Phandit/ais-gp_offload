@@ -11,7 +11,8 @@ import time
 import argparse
 import threading
 import Queue
-import uuid
+import re
+import json
 from datetime import datetime
 
 # ==============================================================================
@@ -168,7 +169,16 @@ class Config(object):
         self.local_temp_dir = os.path.join(main_path, 'temp')
         self.nas_dest_base = os.path.join(main_path, 'output')
         self.log_dir = os.path.join(main_path, 'log')
-        self.data_type_file_path = None
+        self.metadata_base_dir = None
+        self.mapping_file_path = None
+
+        # Default Number Configurations
+        self.env_params = {
+            'default_numeric_p': 38, 'default_numeric_s': 10,
+            'cast_real_p': 24, 'cast_real_s': 6,
+            'cast_double_p': 38, 'cast_double_s': 15,
+            'round_numeric': 10, 'round_real': 5, 'round_double': 14
+        }
         
         try:
             with open(env_config_path, 'r') as f:
@@ -181,14 +191,13 @@ class Config(object):
                         key = key.strip()
                         value = value.strip()
 
-                        if key == 'local_temp_dir':
-                            self.local_temp_dir = value
-                        elif key == 'nas_destination':
-                            self.nas_dest_base = value
-                        elif key == 'log_dir':
-                            self.log_dir = value
-                        elif key == 'data_type_file_path':
-                            self.data_type_file_path = value
+                        if key == 'local_temp_dir': self.local_temp_dir = value
+                        elif key == 'nas_destination': self.nas_dest_base = value
+                        elif key == 'log_dir': self.log_dir = value
+                        elif key == 'metadata_base_dir': self.metadata_base_dir = value
+                        elif key == 'mapping_file_path': self.mapping_file_path = value
+                        elif key in self.env_params:
+                            self.env_params[key] = int(value)
                 
             # Create temp dir if not exists
             if self.local_temp_dir:
@@ -202,11 +211,23 @@ class Config(object):
             self.logger.info("Resolved local_temp_dir: {0}".format(self.local_temp_dir))
             self.logger.info("Resolved nas_dest_base: {0}".format(self.nas_dest_base))
             self.logger.info("Resolved log_dir: {0}".format(self.log_dir))
-            self.logger.info("Resolved data_type_file_path: {0}".format(self.data_type_file_path))
+            self.logger.info("Resolved metadata_base_dir: {0}".format(self.metadata_base_dir))
+            self.logger.info("Resolved mapping_file_path: {0}".format(self.mapping_file_path))
 
         except Exception as e:
             self.logger.error("Failed to load environment config: {0}".format(e))
             raise
+
+        self.type_mapping = {"SUM_MIN_MAX": [], "MIN_MAX": [], "MD5_MIN_MAX": []}
+        if self.mapping_file_path and os.path.exists(self.mapping_file_path):
+            self.logger.info("Loading Data Type Mapping from JSON: {0}".format(self.mapping_file_path))
+            try:
+                with open(self.mapping_file_path, 'r') as f:
+                    self.type_mapping = json.load(f)
+            except Exception as e:
+                self.logger.error("Failed to parse mapping file: {0}. Using empty map.".format(e))
+        else:
+            self.logger.warning("Mapping file not found or path not defined: {0}".format(self.mapping_file_path))
 
         # 2. Load Master Config (Lookup Dictionary)
         # Key: (db_name, schema, table) -> Value: row dict
@@ -216,13 +237,13 @@ class Config(object):
             with open(master_config_path, 'r') as f:
                 reader = csv.reader(f, delimiter='|')
                 for line in reader:
-                    # Format: DB | SCHEMA | table | sum_cols | where
+                    # Format: DB | SCHEMA | table | manual_num_col | manual_thai_col
                     if len(line) < 5: continue
-                    db, sch, tbl, sum_cols, where = [x.strip() for x in line[:5]]
+                    db, sch, tbl, m_num, m_thai = [x.strip() for x in line[:5]]
                     key = (db, sch, tbl)
                     self.master_data[key] = {
-                        'sum_cols': sum_cols, 
-                        'where': where
+                        'manual_num': [x.strip() for x in m_num.split(',') if x.strip().lower() != 'none' and x.strip()],
+                        'manual_thai': [x.strip() for x in m_thai.split(',') if x.strip().lower() != 'none' and x.strip()]
                     }
             self.logger.info("Loaded {0} tables from master config.".format(len(self.master_data)))
         except Exception as e:
@@ -275,71 +296,128 @@ class Config(object):
 # ==============================================================================
 
 class QueryBuilder(object):
-    def __init__(self, temp_dir, logger, global_ts):
+    def __init__(self, temp_dir, env_params, logger, global_ts):
         self.temp_dir = temp_dir
+        self.env_params = env_params
         self.logger = logger
         self.global_ts = global_ts
 
-    def _parse_aggregate_cols(self, cols_data, agg_func):
-        parts = []
-        if not cols_data:
-            return parts
+    def _quote_json_val(self, sql_expr):
+        return "COALESCE('\"' || ({0})::text || '\"', 'null')".format(sql_expr)
+    
+    def _build_num_expr(self, agg_func, col_expr, gp_type):
+        gp_base = gp_type.split('(')[0].strip().lower()
         
-        if isinstance(cols_data, str):
-            if cols_data.strip().lower() == 'none' or not cols_data.strip():
-                return parts
-            cols = [c.strip() for c in cols_data.split(',') if c.strip()]
-        elif isinstance(cols_data, list):
-            cols = cols_data
+        if gp_base == 'numeric' and '(' not in gp_type:
+            p = self.env_params['default_numeric_p']
+            s = self.env_params['default_numeric_s']
+            r = self.env_params['round_numeric']
+            return "ROUND({0}(({1})::numeric({2},{3})), {4})".format(agg_func, col_expr, p, s, r)
+        elif gp_base == 'double precision':
+            p = self.env_params['cast_double_p']
+            s = self.env_params['cast_double_s']
+            r = self.env_params['round_double']
+            return "ROUND({0}(({1})::numeric({2},{3})), {4})".format(agg_func, col_expr, p, s, r)
+        elif gp_base == 'real':
+            p = self.env_params['cast_real_p']
+            s = self.env_params['cast_real_s']
+            r = self.env_params['round_real']
+            return "ROUND({0}(({1})::numeric({2},{3})), {4})".format(agg_func, col_expr, p, s, r)
         else:
-            cols = []
-
-        for col in cols:
-            if agg_func == 'SUM':
-                parts.append("'{1}({0}):' || COALESCE(SUM({0}), 0)::text".format(col, agg_func))
-            elif agg_func in ['MIN', 'MAX']:
-                parts.append("'{1}({0}):' || COALESCE({1}({0})::text, '')".format(col, agg_func))
-        return parts
-
-    def build_and_save_query(self, db, schema, table, sum_cols_str, min_cols_list, max_cols_list, where, missing_flag):
+            return "{0}({1})".format(agg_func, col_expr)
+        
+    def build_json_query(self, db, schema, table, categorized_cols, insert_logic_dict):
         try:
-            # DB|SCHEMA|TABLE
-            tbl_display_logic = "'{0}|{1}|{2}'".format(db, schema, table)
+            full_table_name = "{0}.{1}.{2}".format(db, schema, table)
+            metric_fragments = []
 
-            metric_parts = []
-            metric_parts.extend(self._parse_aggregate_cols(sum_cols_str, 'SUM'))
-            metric_parts.extend(self._parse_aggregate_cols(min_cols_list, 'MIN'))
-            metric_parts.extend(self._parse_aggregate_cols(max_cols_list, 'MAX'))
+            # Combine unique columns per solution category
+            all_num_cols = set(categorized_cols['SUM_MIN_MAX'] + categorized_cols['MANUAL_NUM'])
+            all_date_cols = set(categorized_cols['MIN_MAX'])
+            all_cpx_cols = set(categorized_cols['MD5_MIN_MAX'] + categorized_cols['MANUAL_THAI'])
+
+            num_fragments = []
+            date_fragments = []
+            cpx_fragments = []
+
+            # 1. NUMBER Solution
+            for col, gp_type in categorized_cols['TYPE_MAP'].items():
+                if col in all_num_cols:
+                    base_expr = insert_logic_dict.get(col, '"{0}"'.format(col))
+                    sum_expr = self._build_num_expr('SUM', base_expr, gp_type)
+                    min_expr = self._build_num_expr('MIN', base_expr, gp_type)
+                    max_expr = self._build_num_expr('MAX', base_expr, gp_type)
+                    
+                    json_parts = [
+                        "'\"sum\": ' || {0}".format(self._quote_json_val(sum_expr)),
+                        "'\"min\": ' || {0}".format(self._quote_json_val(min_expr)),
+                        "'\"max\": ' || {0}".format(self._quote_json_val(max_expr))
+                    ]
+                    fragment = "'\"{0}\": {{' || {1} || '}}'".format(col, " || ', ' || ".join(json_parts))
+                    num_fragments.append(fragment)
+                    
+                    # Remove from other sets if overlapped
+                    all_date_cols.discard(col)
+                    all_cpx_cols.discard(col)
+
+            # 2. DATE Solution
+            for col in all_date_cols:
+                base_expr = insert_logic_dict.get(col, '"{0}"'.format(col))
+                min_expr = "MIN({0})::text".format(base_expr)
+                max_expr = "MAX({0})::text".format(base_expr)
+                
+                json_parts = [
+                    "'\"min\": ' || {0}".format(self._quote_json_val(min_expr)),
+                    "'\"max\": ' || {0}".format(self._quote_json_val(max_expr))
+                ]
+                fragment = "'\"{0}\": {{' || {1} || '}}'".format(col, " || ', ' || ".join(json_parts))
+                date_fragments.append(fragment)
+                all_cpx_cols.discard(col)
+
+            # 3. COMPLEX / THAI Solution
+            for col in all_cpx_cols:
+                base_expr = insert_logic_dict.get(col, '"{0}"'.format(col))
+                min_expr = "MIN(MD5(({0})::text))".format(base_expr)
+                max_expr = "MAX(MD5(({0})::text))".format(base_expr)
+                
+                json_parts = [
+                    "'\"min_md5\": ' || {0}".format(self._quote_json_val(min_expr)),
+                    "'\"max_md5\": ' || {0}".format(self._quote_json_val(max_expr))
+                ]
+                fragment = "'\"{0}\": {{' || {1} || '}}'".format(col, " || ', ' || ".join(json_parts))
+                cpx_fragments.append(fragment)
+
+            method_groups = []
+            if num_fragments:
+                method_groups.append("'\"SUM_MIN_MAX\": {{' || {0} || '}}'".format(" || ', ' || ".join(num_fragments)))
+            if date_fragments:
+                method_groups.append("'\"MIN_MAX\": {{' || {0} || '}}'".format(" || ', ' || ".join(date_fragments)))
+            if cpx_fragments:
+                method_groups.append("'\"MD5_MIN_MAX\": {{' || {0} || '}}'".format(" || ', ' || ".join(cpx_fragments)))
+
+            # Assemble Final SQL
+            metrics_sql = " || ', ' || ".join(method_groups) if method_groups else "''"
             
-            if missing_flag:
-                metric_parts.append("'MIN_MAX_STATUS: DATA_TYPE_FILE_MISSING'")
+            # Construct single JSON object string
+            sql = (
+                "SELECT '{{' || "
+                " '\"table\": \"{0}\", ' || "
+                " '\"count\": ' || COUNT(*)::text || ', ' || "
+                " '\"metrics\": {{' || {1} || '}}' || "
+                " '}}' "
+                "FROM {2}.{3};"
+            ).format(full_table_name, metrics_sql, schema, table)
 
-            if metric_parts:
-                metrics_logic = " || ',' || ".join(metric_parts)
-                sql = "SELECT {0} || '|' || COUNT(*)::text || '|' || {1} FROM {2}.{3}".format(
-                    tbl_display_logic, metrics_logic, schema, table
-                )
-            else:
-                sql = "SELECT {0} || '|' || COUNT(*)::text || '|' FROM {1}.{2}".format(
-                    tbl_display_logic, schema, table
-                )
-
-            if where and where.strip() and where.strip().lower() != 'none':
-                sql += " WHERE {0}".format(where)
-
-            sql += ";"
-
-            filename = "query_{0}_{1}_{2}.sql".format(db, table, self.global_ts)
+            filename = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, table, self.global_ts)
             filepath = os.path.join(self.temp_dir, filename)
 
             with open(filepath, 'w') as f:
                 f.write(sql)
 
-            self.logger.info("Generated SQL saved to: {0}".format(filepath))
             return sql
-
+        
         except Exception as e:
-            self.logger.error("Error building query: {0}".format(e))
+            self.logger.error("Error building JSON query: {0}".format(e))
             raise
 
 class ShellHandler(object):
@@ -393,31 +471,30 @@ class Worker(threading.Thread):
         self.global_ts = global_ts
         self.daemon = True
 
-    def _is_min_max_candidate(self, gp_dt, ext_dt):
-        gp_base = str(gp_dt).split('(')[0].strip().lower()
-        ext_base = str(ext_dt).split('(')[0].strip().lower()
-
-        exclude_keywords = [
-            'json', 'xml', 
-            'geometry', 'geography', 'box', 'point', 'line', 'lseg', 'path', 'polygon', 'circle'
-        ]
-
-        if any(keyword in gp_base for keyword in exclude_keywords):
-            return False
+    def _get_latest_metadata(self, db_name, table_name):
+        """Scans metadata_base_dir for the latest data_type and insert_logic files"""
+        if not self.config.metadata_base_dir or not os.path.exists(self.config.metadata_base_dir):
+            return None, None
         
-        valid_gp_types = [
-            'character varying', 'varchar', 'char', 'text', 'string', 
-            'date', 'time', 'timestamp', 
-            'int', 'integer', 'bigint', 'smallint', 
-            'numeric', 'decimal', 'float', 'real', 'double precision'
-        ]
+        target_dir = os.path.join(self.config.metadata_base_dir, db_name)
 
-        valid_ext_types = ['text', 'character varying', 'varchar', 'string', 'char']
-
-        is_gp_ok = any(t in gp_base for t in valid_gp_types)
-        is_ext_ok = any(t in ext_base for t in valid_ext_types)
-
-        return is_gp_ok and is_ext_ok
+        if not os.path.exists(target_dir):
+            return None, None
+            
+        matches_dt = []
+        matches_il = []
+        
+        # Walk through directories to find the most recent file
+        for root, _, files in os.walk(target_dir):
+            for file in files:
+                if file.endswith("_data_type.txt") and table_name in file:
+                    matches_dt.append(os.path.join(root, file))
+                elif file.endswith("_insert_logic.txt") and table_name in file:
+                    matches_il.append(os.path.join(root, file))
+                    
+        latest_dt = sorted(matches_dt)[-1] if matches_dt else None
+        latest_il = sorted(matches_il)[-1] if matches_il else None
+        return latest_dt, latest_il
 
     def run(self):
         while True:
@@ -446,95 +523,89 @@ class Worker(threading.Thread):
 
                         # 1. Config Lookup
                         key = (db, schema, table)
-                        master_info = self.config.master_data.get(key)
+                        master_info = self.config.master_data.get(key, {'manual_num': [], 'manual_thai': []})
 
-                        if not master_info:
-                            self.tracker.add_result(full_name, "SKIPPED", "No Config")
-                            self.logger.warning("Worker {0} Skipping {1}: No Config found in master_data".format(self.name, full_name))
-                            break
+                        # Dynamic Metadata Discovery ---
+                        dt_file, il_file = self._get_latest_metadata(db, table)
+                        missing_flag = False if dt_file else True
 
-                        min_cols = []
-                        max_cols = []
-                        missing_flag = False
+                        # --- Parse Insert Logic ---
+                        insert_logic_dict = {}
+                        if il_file:
+                            try:
+                                with open(il_file, 'r') as f:
+                                    content = f.read()
+                                    current_col = None
+                                    for line in content.splitlines():
+                                        if not line.strip(): continue
+                                        if line == "gp_column_nm;insert_logic": continue # skip Header
+                                        
+                                        # match "column_name;logic"
+                                        match = re.match(r'^([a-zA-Z0-9_]+);(.*)', line)
+                                        if match:
+                                            current_col = match.group(1)
+                                            insert_logic_dict[current_col] = match.group(2)
+                                        elif current_col:
+                                            insert_logic_dict[current_col] += " \n" + line
+                            except Exception as e:
+                                self.logger.warning("Worker {0} error reading logic file {1}: {2}".format(self.name, il_file, e))
 
-                        csv_path = None
-                        if self.config.data_type_file_path:
-                            csv_path = os.path.join(self.config.data_type_file_path, db, schema, "{0}.csv".format(table))
-                        
-                        if csv_path:
-                            self.logger.info("Worker {0} looking for data type mapping file at: {1}".format(self.name, csv_path))
-                            if os.path.exists(csv_path):
-                                self.logger.info("Worker {0} found data type mapping file: {1}".format(self.name, csv_path))
-                                try:
-                                    with open(csv_path, 'r') as cf:
-                                        reader = csv.DictReader(cf, delimiter='|')
-                                        for row in reader:
-                                            gp_col = row.get('gp_column_nm')
-                                            gp_dt = row.get('gp_datatype', '')
-                                            ext_dt = row.get('ext_datatype', '')
-                                            
-                                            if gp_col and self._is_min_max_candidate(gp_dt, ext_dt):
-                                                min_cols.append(gp_col.strip())
-                                                max_cols.append(gp_col.strip())
-                                    self.logger.info("Worker {0} identified {1} MIN/MAX columns for {2}".format(self.name, len(min_cols), full_name))
-                                except Exception as e:
-                                    self.logger.warning("Worker {0} error reading data type file {1}: {2}".format(self.name, csv_path, e))
-                                    missing_flag = True
-                            else:
-                                self.logger.warning("Worker {0} Data type mapping file NOT FOUND: {1}".format(self.name, csv_path))
+                        cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': {}, 
+                                    'MANUAL_NUM': master_info['manual_num'], 
+                                    'MANUAL_THAI': master_info['manual_thai']}
+                        if dt_file:
+                            try:
+                                with open(dt_file, 'r') as f:
+                                    reader = csv.DictReader(f, delimiter='|')
+                                    for row in reader:
+                                        col_nm = row.get('gp_column_nm', '').strip()
+                                        gp_dt = row.get('gp_datatype', '').strip()
+                                        ext_dt = row.get('ext_datatype', '').strip().lower()
+
+                                        if col_nm and gp_dt:
+                                            cat_cols['TYPE_MAP'][col_nm] = gp_dt
+                                            if any(t in ext_dt for t in ['text', 'varchar', 'character', 'string']):
+                                                gp_base = gp_dt.split('(')[0].strip().lower()
+
+                                                if gp_base in self.config.type_mapping.get("SUM_MIN_MAX", []):
+                                                    cat_cols['SUM_MIN_MAX'].append(col_nm)
+                                                elif gp_base in self.config.type_mapping.get("MIN_MAX", []):
+                                                    cat_cols['MIN_MAX'].append(col_nm)
+                                                elif gp_base in self.config.type_mapping.get("MD5_MIN_MAX", []):
+                                                    cat_cols['MD5_MIN_MAX'].append(col_nm)
+                            except Exception as e:
+                                self.logger.warning("Worker {0} error reading data type file {1}: {2}".format(self.name, dt_file, e))
                                 missing_flag = True
-                        else:
-                            self.logger.warning("Worker {0} data_type_file_path is None. Skipping MIN/MAX search for {1}".format(self.name, full_name))
-                            missing_flag = True
 
-                        # 2. Build SQL
-                        sql = self.builder.build_and_save_query(
-                            db, 
-                            schema, 
-                            table, 
-                            master_info['sum_cols'],
-                            min_cols,
-                            max_cols,
-                            master_info['where'],
-                            missing_flag
-                        )
-
-                        # 3. PSQL
-                        output_filename = "{0}_{1}_{2}.txt".format(db, table, self.global_ts)
+                        # --- Call JSON builder and save as .json file ---
+                        sql = self.builder.build_json_query(db, schema, table, cat_cols, insert_logic_dict)
+                        output_filename = "{0}_{1}_{2}_{3}.json".format(db, schema, table, self.global_ts)
                         local_path = os.path.join(self.config.local_temp_dir, output_filename)
 
                         self.shell.run_psql(sql, local_path, db)
+                        final_nas_dest = os.path.join(self.config.nas_dest_base, db, schema)
+                        self.file_h.copy_to_nas(local_path, final_nas_dest)
 
-                        # 4. Copy
-                        self.file_h.copy_to_nas(local_path, self.config.nas_dest_base)
-
-                        # Success or Warning
+                        # Complete Task
                         if missing_flag:
-                            warning_msg = "Count/Sum successful, unable to process min/max because the data type mapping file was not found."
-                            self.tracker.add_result(full_name, "WARNING", warning_msg)
+                            self.tracker.add_result(full_name, "WARNING", "Count-only. Metadata file missing.")
                         else:
                             self.tracker.add_result(full_name, "SUCCESS", "-")
 
                         self.tracker.log_step(full_name, time.time() - start_t)
-                        self.logger.info("Worker {0} completed table: {1}".format(self.name, full_name))
-                        break # Break retry loop on success
+                        break # break retry loop on success
 
                     except Exception as e:
                         safe_err = repr(e)
                         if attempt < max_retries - 1:
-                            self.logger.warning("Worker {0} failed on {1}. Retrying ... Error: {2}".format(self.name, full_name, safe_err))
                             time.sleep(3)
                         else:
-                            # Final Failure
                             self.tracker.add_result(full_name, "FAILED", str(safe_err))
-                            self.logger.error("Worker {0} Failed {1}: {2}".format(self.name, full_name, safe_err))
-            
+
             except Exception as outer_e:
-                safe_err = repr(outer_e)
-                self.logger.error("Worker {0} FATAL CRASH on a task. Error: {1}".format(self.name, safe_err))
-                self.tracker.add_result(str(task.get('table', 'UNKNOWN')), "CRASHED", safe_err)
+                self.logger.error("Worker {0} FATAL CRASH. Error: {1}".format(self.name, repr(outer_e)))
+                self.tracker.add_result(str(task.get('table', 'UNKNOWN')), "CRASHED", repr(outer_e))
             finally:
-                # Mark task done in queue
                 self.queue.task_done()
 
 class MonitorThread(threading.Thread):
@@ -602,7 +673,7 @@ class GreenplumExportJob(object):
 
         # Init Helpers
         self.config = Config(args.env, args.master, args.list, args.table_name, logger, global_date_folder, main_path)
-        self.builder = QueryBuilder(self.config.local_temp_dir, logger, self.global_ts)
+        self.builder = QueryBuilder(self.config.local_temp_dir, self.config.env_params, logger, self.global_ts)
         self.shell = ShellHandler(logger)
         self.file_h = FileHandler(logger)
 
@@ -676,7 +747,7 @@ if __name__ == "__main__":
     configured_log_dir = peek_env_config(args.env, 'log_dir')
     final_log_dir = configured_log_dir if configured_log_dir else os.path.join(main_path, 'log')
 
-    logger, log_path = setup_logging(final_log_dir, 'gp_export', global_date_folder, global_ts)
+    logger, log_path = setup_logging(final_log_dir, 'reconcile_query_greenplum', global_date_folder, global_ts)
     
     logger.info("============================================================")
     logger.info("Started with concurrency: {0}".format(args.concurrency))
