@@ -23,6 +23,10 @@
 
 # 5. ยกเว้น (Keep) ไฟล์ที่คุณต้องการจริงๆ
 !/script_query_greenplum/script_query_greenplum.py
+!/script_query_greenplum/config/config_master.txt
+!/script_query_greenplum/config/data_type_mapping.json
+!/script_query_greenplum/config/env_config.txt
+!/script_query_greenplum/config/list_table.txt
 !/script_sum_reconcile/script/script_sum_reconcile.py
 !/script_reconcile_content/script/script_reconcile_content.py
 
