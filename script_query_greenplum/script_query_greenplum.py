@@ -161,7 +161,7 @@ def peek_env_config(env_path, key_to_find):
 # ==============================================================================
 
 class Config(object):
-    def __init__(self, env_config_path, master_config_path, list_file_path, cli_tables, logger, date_folder = None, main_path=None):
+    def __init__(self, env_config_path, list_file_path, cli_tables, logger, date_folder = None, main_path=None):
         self.logger = logger
         
         # 1. Load Environment Config
@@ -170,6 +170,7 @@ class Config(object):
         self.nas_dest_base = os.path.join(main_path, 'output')
         self.log_dir = os.path.join(main_path, 'log')
         self.metadata_base_dir = None
+        self.config_master_file_path = None
         self.mapping_file_path = None
 
         # Default Number Configurations
@@ -195,6 +196,7 @@ class Config(object):
                         elif key == 'nas_destination': self.nas_dest_base = value
                         elif key == 'log_dir': self.log_dir = value
                         elif key == 'metadata_base_dir': self.metadata_base_dir = value
+                        elif key == 'config_master_file_path': self.config_master_file_path = value
                         elif key == 'mapping_file_path': self.mapping_file_path = value
                         elif key in self.env_params:
                             self.env_params[key] = int(value)
@@ -232,9 +234,9 @@ class Config(object):
         # 2. Load Master Config (Lookup Dictionary)
         # Key: (db_name, schema, table) -> Value: row dict
         self.master_data = {}
-        self.logger.info("Loading master config: {0}".format(master_config_path))
+        self.logger.info("Loading master config: {0}".format(self.config_master_file_path))
         try:
-            with open(master_config_path, 'r') as f:
+            with open(self.config_master_file_path, 'r') as f:
                 reader = csv.reader(f, delimiter='|')
                 for line in reader:
                     # Format: DB | SCHEMA | table | manual_num_col | manual_thai_col
@@ -377,8 +379,8 @@ class QueryBuilder(object):
             # 3. COMPLEX / THAI Solution
             for col in all_cpx_cols:
                 base_expr = insert_logic_dict.get(col, '"{0}"'.format(col))
-                min_expr = "MIN(MD5(({0})::text))".format(base_expr)
-                max_expr = "MAX(MD5(({0})::text))".format(base_expr)
+                min_expr = "MIN(MD5(COALESCE(({0})::text, '')))".format(base_expr)
+                max_expr = "MAX(MD5(COALESCE(({0})::text, '')))".format(base_expr)
                 
                 json_parts = [
                     "'\"min_md5\": ' || {0}".format(self._quote_json_val(min_expr)),
@@ -678,7 +680,7 @@ class GreenplumExportJob(object):
         self.tracker = ProcessTracker(logger)
 
         # Init Helpers
-        self.config = Config(args.env, args.master, args.list, args.table_name, logger, global_date_folder, main_path)
+        self.config = Config(args.env, args.list, args.table_name, logger, global_date_folder, main_path)
         self.builder = QueryBuilder(self.config.local_temp_dir, self.config.env_params, logger, self.global_ts)
         self.shell = ShellHandler(logger)
         self.file_h = FileHandler(logger)
