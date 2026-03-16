@@ -1,0 +1,940 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import csv
+import logging
+import subprocess
+import time
+import argparse
+import threading
+import Queue
+import glob
+import re
+import json
+import shutil
+import collections
+from decimal import Decimal
+from datetime import datetime
+
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+
+# ==============================================================================
+# 1. Utilities: Logger & ProcessTracker
+# ==============================================================================
+
+class ProcessTracker(object):
+    def __init__(self, logger):
+        self.logger = logger
+        self.lock = threading.Lock()
+        self.results = []
+        self.worker_status = {}
+        self.total_task = 0
+        self.completed_task = 0
+        self.start_time = time.time()
+
+    def set_total_task(self, total):
+        self.total_task = total
+
+    def update_worker_status(self, worker_name, status):
+        self.worker_status[worker_name] = status
+
+    def add_result(self, table_name, status, duration=0.0, remark="-"):
+            with self.lock:
+                self.results.append({
+                    'table': table_name, 
+                    'status': status,
+                    'duration': duration,
+                    'remark': str(remark).replace('\n', ' ')
+                })
+                self.completed_task += 1
+
+    def get_progress(self):
+        with self.lock:
+            return self.completed_task, self.total_task
+        
+    def print_summary(self, log_path, output_path):
+        self.logger.info("="*100)
+        self.logger.info("PARQUET JSON QUERY SUMMARY")
+        self.logger.info("="*100)
+
+        success_count = 0
+        warning_count = 0
+        failed_count = 0
+        skipped_count = 0
+
+        if not self.results:
+            self.logger.info("No Partitions processed.")
+        else:
+            h_table = "Partition Name"
+            h_status = "Status"
+            h_dur = "Duration(s)"
+            h_msg = "Remark"
+
+            max_w_table = len(h_table)
+            max_w_status = len(h_status)
+
+            for r in self.results:
+                if len(r['table']) > max_w_table: max_w_table = len(r['table'])
+                if len(r['status']) > max_w_status: max_w_status = len(r['status'])
+
+                if r['status'] == 'COMPLETED': success_count += 1
+                elif r['status'] == 'WARNING': warning_count += 1
+                elif r['status'] == 'FAILED': failed_count += 1
+                elif r['status'] == 'SKIPPED': skipped_count +=1
+            
+            w_table = max_w_table + 2
+            w_status = max_w_status + 2
+
+            row_fmt = "{0:<{wt}} | {1:<{ws}} | {2:<11} | {3}"
+            header_line = row_fmt.format(h_table, h_status, h_dur, h_msg, wt=w_table, ws=w_status)
+            sep_line = "-" * len(header_line)
+            if len(sep_line) < 90: sep_line = "-" * 90
+
+            self.logger.info(sep_line)
+            self.logger.info(header_line)
+            self.logger.info(sep_line)
+
+            for r in self.results:
+                dur_str = "{0:.2f}".format(r.get('duration', 0.0))
+                self.logger.info(row_fmt.format(
+                    r['table'], r['status'], dur_str, r['remark'], wt=w_table, ws=w_status
+                ))
+            
+            self.logger.info(sep_line)
+            self.logger.info("Total: {0} | Completed: {1} | Warning: {2} | Failed: {3} | Skipped: {4}".format(
+                len(self.results), success_count, warning_count, failed_count, skipped_count
+            ))
+            self.logger.info("Total Execution Time: {0:.2f}s".format(time.time() - self.start_time))
+
+        # Write summary to output directory
+        summary_file = os.path.join(output_path, "reconcile_summary_{0}.txt".format(datetime.now().strftime("%Y%m%d_%H%M%S")))
+        try:
+            with open(summary_file, 'w') as f:
+                f.write("Total: {0}\nCompleted: {1}\nFailed: {2}\nSkipped: {3}\n".format(
+                    len(self.results), success_count, failed_count, skipped_count))
+        except Exception as e:
+            self.logger.error("Could not write summary file to output: {0}".format(e))
+
+        # Print Summary to Console
+        print("\n" + "="*80)
+        print("FINAL SUMMARY REPORT")
+        print("="*80)
+        print("Total    : {0}".format(len(self.results)))
+        print("Completed: {0}".format(success_count))
+        print("Warning  : {0}".format(warning_count))
+        print("Failed   : {0}".format(failed_count))
+        print("Skipped  : {0}".format(skipped_count))
+        print("Log File : {0}".format(log_path))
+        print("Output   : {0}".format(summary_file))
+        print("="*80)
+
+def setup_logging(log_dir, log_name="app", timestamp=None):
+    if not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir)
+        except OSError as e:
+            print("WARNING: Could not create log directory '{0}'. Error: {1}".format(log_dir, e))
+            log_dir = '.'
+
+    log_file = os.path.join(log_dir, "{0}_{1}.log".format(log_name, timestamp))
+    logger = logging.getLogger("ParquetQueryBatch")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger, log_file
+
+# ==============================================================================
+# 2. Configuration Class
+# ==============================================================================
+
+class ConfigManager(object):
+    def __init__(self, env_config_path, master_config_path, map_config_path, list_file_path, cli_tables, logger):
+        self.logger = logger
+
+        self.logger.info("Loading environment config: {0}".format(env_config_path))
+        self.succeed_path = ''
+        self.hdfs_path = ''
+        self.replace_path_from = ''
+        self.replace_path_to = ''
+        self.metadata_base_dir = ''
+        self.datatype_mapping_path = ''
+        self.gp_db = ''
+        self.thai_mapping_table = ''
+        self.thai_mapping_export_path = ''
+        self.thai_dict = {}
+
+        self.env_params = {
+            'default_numeric_p': 38, 'default_numeric_s': 10,
+            'cast_real_p': 24, 'cast_real_s': 6,
+            'cast_double_p': 38, 'cast_double_s': 15,
+            'round_numeric': 10, 'round_real': 5, 'round_double': 14
+        }
+
+        # 1. Load Standalone Environment Config
+        try:
+            with open(env_config_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'): continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        if key == 'succeed_path': self.succeed_path = value
+                        elif key =='hdfs_path': self.hdfs_path = value
+                        elif key == 'replace_path_from': self.replace_path_from = value
+                        elif key == 'replace_path_to': self.replace_path_to = value
+                        elif key == 'metadata_base_dir': self.metadata_base_dir = value
+                        elif key == 'nas_destination': self.nas_destination = value
+                        elif key == 'mapping_file_path': self.mapping_file_path = value
+                        elif key == 'config_master_file_path': self.master_file_path = value
+                        elif key == 'gp_db': self.gp_db = value
+                        elif key == 'thai_mapping_table': self.thai_mapping_table = value
+                        elif key == 'thai_mapping_export_path': self.thai_mapping_export_path = value
+                        elif key in self.env_params:
+                            self.env_params[key] = int(value)
+        except IOError as e:
+            self.logger.critical("Cannot find env_config file: {0}".format(e))
+            raise
+
+        # 2. Load Target Tables (Moved up before Thai mapping logic to build IN clause)
+        self.execution_list = []
+        if cli_tables:
+            self.logger.info("Using CLI arguments for table list.")
+            tables = cli_tables.split(',')
+            for t in tables:
+                try:
+                    db_part, tbl_part = t.split('|')
+                    self.execution_list.append({'db': db_part.strip(), 'partition': tbl_part.strip()})
+                except ValueError:
+                    self.logger.error("Invalid format in argument: {0}. Expected DB|Schema.Partition".format(t))
+        else:
+            self.logger.info("Using list file: {0}".format(list_file_path))
+            try:
+                with open(list_file_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'): continue
+                        try:
+                            db_part, tbl_part = line.split('|')
+                            sch_part, real_tbl = tbl_part.split('.')
+                            self.execution_list.append({
+                                'db': db_part.strip(), 
+                                'schema': sch_part.strip(), 
+                                'partition': real_tbl.strip()
+                            })
+                        except ValueError:
+                            self.logger.warning("Skipping invalid line in list file: {0}".format(line))
+            except IOError as e:
+                self.logger.critical("Cannot find list_table file: {0}".format(e))
+                raise
+
+        # 3. Export and Load Thai Mapping via subprocess psql
+        if self.gp_db and self.thai_mapping_table and self.thai_mapping_export_path:
+            if not self._export_thai_mapping():
+                raise RuntimeError("Failed to export Thai mapping from Greenplum. Aborting script.")
+            self._load_thai_mapping()
+        else:
+            self.logger.warning("Thai mapping config missing in env_config. Skipping GP query.")
+
+        # 4. Load Shared Master Config
+        self.master_data = {}
+        target_master_path = getattr(self, 'master_file_path', '') or master_config_path
+        self.logger.info("Loading config_master (Shared): {0}".format(master_config_path))
+        try:
+            with open(target_master_path, 'r') as f:
+                reader = csv.reader(f, delimiter='|')
+                for line in reader:
+                    if len(line) < 4: continue
+                    db, sch, tbl, m_num = [x.strip() for x in line[:4]]
+                    self.master_data[(db, sch, tbl)] = {
+                        'manual_num': [x.strip().lower() for x in m_num.split(',') if x.strip().lower() != 'none' and x.strip()]
+                    }
+        except Exception as e:
+            self.logger.error("Failed to load master config: {0}".format(e))
+            raise
+
+        # 5. Load Shared Data Type Mapping
+        self.type_mapping = {"SUM_MIN_MAX": [], "MIN_MAX": [], "MD5_MIN_MAX": []}
+        target_map_path = getattr(self, 'mapping_file_path', '') or map_config_path
+        self.logger.info("Loading data_type_mapping (Shared): {0}".format(map_config_path))
+        try:
+            with open(target_map_path, 'r') as f:
+                self.type_mapping = json.load(f)
+        except Exception as e:
+            self.logger.error("Failed to load JSON mapping: {0}".format(e))
+
+    def _export_thai_mapping(self):
+        target_tables = set(["{0}.{1}".format(t['schema'], t['partition']) for t in self.execution_list])
+        if not target_tables:
+            return True
+        
+        table_list = ["'{0}'".format(tbl) for tbl in target_tables]
+        in_clause = ",".join(table_list)
+        
+        sql_query = "\\copy (SELECT database_name, original_table_name, th_column_name, active_flag FROM {0} WHERE original_table_name IN ({1})) TO '{2}' WITH CSV HEADER;".format(
+            self.thai_mapping_table, in_clause, self.thai_mapping_export_path)
+        self.logger.info("Generated SQL Query for Thai Mapping: {0}".format(sql_query))
+        cmd = [
+            'psql',
+            '-d', self.gp_db,
+            '-c', sql_query
+        ]
+
+        self.logger.info("Executing subprocess to export Thai mapping to {0}".format(self.thai_mapping_export_path))
+        try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            
+            if process.returncode == 0:
+                self.logger.info("Export Thai mapping via psql successful.")
+                return True
+            else:
+                self.logger.error("psql export failed:\n{0}".format(stderr.decode('utf-8', errors='ignore')))
+                return False
+        except Exception as e:
+            self.logger.error("Failed to execute psql subprocess: {0}".format(e))
+            return False
+        
+    def _load_thai_mapping(self):
+        if not os.path.exists(self.thai_mapping_export_path):
+            self.logger.warning("Thai mapping file not found at {0}".format(self.thai_mapping_export_path))
+            return
+        
+        try:
+            with open(self.thai_mapping_export_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    db = row.get('database_name', '').strip().lower()
+                    tbl_raw = row.get('original_table_name', '').strip().lower()
+                    if '.' in tbl_raw:
+                        tbl = tbl_raw.split('.')[-1]
+                    else:
+                        tbl = tbl_raw
+                    col = row.get('th_column_name', '').strip().lower()
+                    flag = row.get('active_flag', '').strip().upper()
+                    if db and tbl and col:
+                        if (db, tbl) not in self.thai_dict:
+                            self.thai_dict[(db, tbl)] = {}
+                        self.thai_dict[(db, tbl)][col] = flag
+            self.logger.info("Loaded Thai mapping configuration for {0} tables.".format(len(self.thai_dict)))
+        except Exception as e:
+            self.logger.error("Error loading Thai mapping CSV: {0}".format(e))
+
+# ==============================================================================
+# 3. Handler & Helper Classes
+# ==============================================================================
+
+class SparkQueryBuilder(object):
+    def __init__(self, env_params, type_mapping, logger):
+        self.env_params = env_params
+        self.type_mapping = type_mapping
+        self.logger = logger
+
+    def _build_num_expr(self, agg_func, col, gp_type):
+        """ REQ 5.1: Numeric Type handling with precision, scale and rounding """
+        gp_base = gp_type.split('(')[0].strip().lower()
+        
+        # 1. Defaults
+        p, s, r = 38, 10, 10 
+        is_exact_int = False
+
+        if gp_base == 'numeric' and '(' in gp_type:
+            try:
+                ps = gp_type.split('(')[1].replace(')', '').split(',')
+                p = int(ps[0].strip())
+                s = int(ps[1].strip())
+                r = s # SLA: Rounding equals scale if defined
+            except: pass
+        elif gp_base == 'numeric':
+            p, s, r = self.env_params['default_numeric_p'], self.env_params['default_numeric_s'], self.env_params['round_numeric']
+        elif gp_base == 'double precision':
+            p, s, r = self.env_params['cast_double_p'], self.env_params['cast_double_s'], self.env_params['round_double']
+        elif gp_base == 'real':
+            p, s, r = self.env_params['cast_real_p'], self.env_params['cast_real_s'], self.env_params['round_real']
+        elif gp_base in ['smallint', 'integer', 'bigint']:
+            is_exact_int = True
+
+        # 2. Build SparkSQL String Expression
+        if is_exact_int:
+            # Prevents overflow by casting to bigint before sum
+            return "CAST({0}(CAST(`{1}` AS BIGINT)) AS STRING)".format(agg_func, col)
+        else:
+            # Apply Cast -> Aggregate -> Round -> Cast to String
+            return "CAST(ROUND({0}(CAST(`{1}` AS DECIMAL({2},{3}))), {4}) AS STRING)".format(
+                agg_func, col, p, s, r
+            )
+
+    def _build_date_expr(self, agg_func, col, gp_type):
+        """ REQ 5.2: Date/Time Type with Regex and Named Struct logic """
+        # Step 1: Base Regex Cleansing (Handles year > 9999 and 24:00:00)
+        clean_str = "regexp_replace(regexp_replace(CAST(`{0}` AS STRING), '^[0-9]{{5,}}-', '9999-'), '24:00:00', '23:59:59')".format(col)
+
+        # Step 2: Specific Data Type Parsing (Determine Timestamp Format)
+        ts_parse = ""
+        gp_base = gp_type.split('(')[0].strip().lower()
+        if 'timestamp' in gp_base:
+            ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss G') ELSE to_timestamp({1}) END".format(col, clean_str)
+        elif 'date' in gp_base:
+            ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd G') ELSE to_timestamp({1}, 'yyyy-MM-dd') END".format(col, clean_str)
+        elif 'time' in gp_base:
+            ts_parse = "to_timestamp(concat('1970-01-01 ', {0}))".format(clean_str)
+        else:
+            ts_parse = "to_timestamp({0})".format(clean_str)
+
+        # Step 3: Build Struct for Aggregation
+        struct_expr = "CASE WHEN {0} IS NULL THEN NULL ELSE named_struct('ts', {0}, 'val', CAST(`{1}` AS STRING)) END".format(ts_parse, col)
+
+        # Step 4: Extract Aggregated Value
+        return "{0}({1}).val".format(agg_func, struct_expr)
+
+    def _build_md5_expr(self, agg_func, col):
+        """ REQ 5.3: MD5 Type without Trim """
+        # Null-safe cast to string, then md5, then agg
+        return "CAST({0}(MD5(COALESCE(CAST(`{1}` AS STRING), ''))) AS STRING)".format(agg_func, col)
+
+    def build_agg_exprs(self, cat_cols):
+        """
+        Takes Dictionary of categorized columns and returns Spark DataFrame expressions
+        Example cat_cols: {'SUM_MIN_MAX': ['col1'], 'MIN_MAX': ['col2'], 'MD5_MIN_MAX': ['col3'], 'TYPE_MAP': {'col1':'numeric(18,2)'}}
+        """
+        exprs = [F.expr("CAST(COUNT(*) AS STRING)").alias("count")]
+
+        all_num_cols = set(cat_cols['SUM_MIN_MAX'] + cat_cols['MANUAL_NUM'])
+        all_date_cols = set(cat_cols['MIN_MAX'])
+        all_cpx_cols = set(cat_cols['MD5_MIN_MAX'])
+
+        for col in all_num_cols:
+            all_date_cols.discard(col)
+            all_cpx_cols.discard(col)
+        for col in all_date_cols:
+            all_cpx_cols.discard(col)
+        
+        # 1. SUM_MIN_MAX
+        for col in all_num_cols:
+            gp_type = cat_cols['TYPE_MAP'].get(col, 'numeric')
+            exprs.append(F.expr(self._build_num_expr('SUM', col, gp_type)).alias("SUM_MIN_MAX|{0}|sum".format(col)))
+            exprs.append(F.expr(self._build_num_expr('MIN', col, gp_type)).alias("SUM_MIN_MAX|{0}|min".format(col)))
+            exprs.append(F.expr(self._build_num_expr('MAX', col, gp_type)).alias("SUM_MIN_MAX|{0}|max".format(col)))
+
+        # 2. MIN_MAX
+        for col in all_date_cols:
+            gp_type = cat_cols['TYPE_MAP'].get(col, 'timestamp')
+            exprs.append(F.expr(self._build_date_expr('MIN', col, gp_type)).alias("MIN_MAX|{0}|min".format(col)))
+            exprs.append(F.expr(self._build_date_expr('MAX', col, gp_type)).alias("MIN_MAX|{0}|max".format(col)))
+
+        # 3. MD5_MIN_MAX
+        for col in all_cpx_cols:
+            exprs.append(F.expr(self._build_md5_expr('MIN', col)).alias("MD5_MIN_MAX|{0}|min_md5".format(col)))
+            exprs.append(F.expr(self._build_md5_expr('MAX', col)).alias("MD5_MIN_MAX|{0}|max_md5".format(col)))
+
+        return exprs
+
+class LogParser(object):
+    def __init__(self, succeed_base_path, logger):
+        self.succeed_base_path = succeed_base_path
+        self.logger = logger
+        self.cache = {} 
+        self.lock = threading.Lock()
+
+    def get_latest_succeed_info(self, db, schema, partition):
+        cache_key = "{0}_{1}".format(db, schema)
+        
+        with self.lock:
+            if cache_key not in self.cache:
+                self.logger.info("[LogParser] Building memory cache for DB: {0}, Schema: {1} ...".format(db, schema))
+                self.cache[cache_key] = {}
+                
+                search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
+                # search_pattern = os.path.join(self.succeed_base_path, db, "backup_old_file", "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
+                self.logger.info("[LogParser] Searching for succeed log using pattern: {0}".format(search_pattern))
+                matched_files = sorted(glob.glob(search_pattern), reverse=True)
+
+                if not matched_files:
+                    self.logger.warning("[LogParser] Log files not found for pattern: {0}".format(search_pattern))
+                else:
+                    expected_fields = [
+                        "Run_ID", "Greenplum_Tbl", "Hive_Tbl", 
+                        "Start_Timestamp_Script", "End_Timestamp_Script", "Duration_Script", 
+                        "Start_Timestamp_Spark", "End_Timestamp_Spark", "Duration_Spark", 
+                        "Run_Status", "Error_Message", "Source_Count", 
+                        "Target_Count", "Size", "Avg_Row_Len", 
+                        "File_Path", "Remark"
+                    ]
+                    for log_file in matched_files:
+                        self.logger.info("[LogParser] Scanning log file into cache: {0}".format(log_file))
+                        try:
+                            with open(log_file, 'r') as f:
+                                reader = csv.DictReader(f, fieldnames=expected_fields)
+                                for row in reader:
+                                    gp_tbl = row.get('Greenplum_Tbl', '')
+                                    status = row.get('Run_Status', '')
+
+                                    if gp_tbl == 'Greenplum_Tbl':
+                                        continue
+                                    
+                                    if gp_tbl and status == 'SUCCEEDED':
+                                        if gp_tbl not in self.cache[cache_key]:
+                                            self.cache[cache_key][gp_tbl] = row
+                                        else:
+                                            current_ts = self.cache[cache_key][gp_tbl].get('End_Timestamp_Script', '')
+                                            new_ts = row.get('End_Timestamp_Script', '')
+                                            if new_ts > current_ts:
+                                                self.cache[cache_key][gp_tbl] = row
+                        except Exception as e:
+                            self.logger.warning("[LogParser] Error parsing log file {0}: {1}".format(log_file, e))
+                self.logger.info("[LogParser] Cache build completed. Total {0} tables cached.".format(len(self.cache[cache_key])))
+
+        target_table_with_schema = "{0}.{1}".format(schema, partition)
+        
+        latest_row = self.cache[cache_key].get(partition) or self.cache[cache_key].get(target_table_with_schema)
+        
+        if latest_row:
+            self.logger.info("[LogParser] Found latest SUCCEEDED record for {0} from Cache. Target Parquet: {1}".format(
+                partition, latest_row.get('File_Path', 'N/A')))
+            return latest_row, "Found SUCCEEDED record"
+        else:
+            self.logger.warning("[LogParser] Status is not SUCCEEDED in cache for {0}".format(partition))
+            return None, "Status is not SUCCEEDED in any log files"
+    
+class HDFSHandler(object):
+    def __init__(self, spark_session, logger):
+        self.logger = logger
+        self.spark = spark_session
+
+        self.sc = self.spark.sparkContext
+        self.hadoop_conf = self.sc._jsc.hadoopConfiguration()
+        self.fs = self.sc._jvm.org.apache.hadoop.fs.FileSystem.get(self.hadoop_conf)
+        self.Path = self.sc._jvm.org.apache.hadoop.fs.Path
+
+    def sync_parquet(self, local_file_path, hdfs_dest_path):
+        self.logger.info("[HDFSHandler] Evaluating HDFS sync. Local: {0} -> HDFS: {1}".format(local_file_path, hdfs_dest_path))
+        try:
+            local_mtime = os.path.getmtime(local_file_path)
+        except OSError as e:
+            raise RuntimeError("Local path not found or inaccessible: {0}".format(e))
+        
+        local_path_str = "file:///" + os.path.abspath(local_file_path).replace("\\", "/").lstrip("/")
+        local_path_obj = self.Path(local_path_str)
+        hdfs_path_obj = self.Path(hdfs_dest_path)
+
+        needs_upload = False
+
+        if not self.fs.exists(hdfs_path_obj):
+            needs_upload = True
+        else:
+            try:
+                file_status = self.fs.getFileStatus(hdfs_path_obj)
+                hdfs_mtime = file_status.getModificationTime() / 1000.0
+
+                if local_mtime > hdfs_mtime:
+                    needs_upload = True
+            except Exception as e:
+                self.logger.warning("Could not get HDFS file status via JVM. Forcing upload. Error: {0}".format(e))
+                needs_upload = True
+
+        if needs_upload:
+            self.logger.info("[HDFSHandler] Proceeding to upload Parquet to HDFS: {0}".format(hdfs_dest_path))
+            try:
+                parent_path = hdfs_path_obj.getParent()
+                if parent_path and not self.fs.exists(parent_path):
+                    self.fs.mkdirs(parent_path)
+                
+                self.fs.copyFromLocalFile(False, True, local_path_obj, hdfs_path_obj)
+            except Exception as e:
+                raise RuntimeError("HDFS copyFromLocalFile via JVM failed: {0}".format(e))
+        else:
+            self.logger.info("[HDFSHandler] Parquet file is up-to-date. Skipping HDFS upload.")
+        return True
+
+class MetadataFetcher(object):
+    def __init__(self, base_dir, logger):
+        self.base_dir = base_dir
+        self.logger = logger
+
+    def fetch_data_types(self, db_name, table_name):
+        if not self.base_dir or not os.path.exists(self.base_dir): return None
+        
+        target_dir = os.path.join(self.base_dir, db_name)
+        if not os.path.exists(target_dir): return None
+            
+        matches = [os.path.join(r, f) for r, _, fs in os.walk(target_dir) for f in fs if f.endswith("_data_type.txt") and table_name in f]
+        latest_file = sorted(matches)[-1] if matches else None
+        
+        type_map = {}
+        if latest_file:
+            try:
+                with open(latest_file, 'r') as f:
+                    reader = csv.DictReader(f, delimiter='|')
+                    for row in reader:
+                        col_nm = row.get('gp_column_nm', '').strip()
+                        gp_dt = row.get('gp_datatype', '').strip()
+                        
+                        if col_nm and gp_dt:
+                            type_map[col_nm.lower()] = gp_dt
+            except Exception as e:
+                self.logger.warning("Error reading data type file {0}: {1}".format(latest_file, e))
+                return None
+        return type_map
+
+class HiveLogger(object):
+    def __init__(self, spark_session, logger):
+        self.spark = spark_session
+        self.logger = logger
+        self.table_header = "output_reconcile_reconcile_query_parquet"
+        self.insert_lock = threading.Lock()
+
+    def log_execution_status(self, execution_id, db, schema, table, partition, start_ts, end_ts, duration, status, remark):
+        safe_remark = str(remark).replace("'", "") if remark else ""
+        insert_sql = """
+            INSERT INTO TABLE {0}
+            VALUES ('{1}', '{2}', '{3}', '{4}', '{5}', cast('{6}' as timestamp), cast('{7}' as timestamp), cast({8} as decimal(18,2)), '{9}', '{10}')
+        """.format(self.table_header, execution_id, db, schema, table, partition, start_ts.strftime('%Y-%m-%d %H:%M:%S'), end_ts.strftime('%Y-%m-%d %H:%M:%S'), duration, status, safe_remark)
+        try:
+            with self.insert_lock: self.spark.sql(insert_sql)
+        except Exception as e:
+            self.logger.warning("Hive Log Insert Failed: {0}".format(e))
+
+# ==============================================================================
+# 4. Parallel Workers & Monitor
+# ==============================================================================
+
+class Worker(threading.Thread):
+    def __init__(self, thread_id, job_queue, config, log_parser, hdfs_h, meta_fetcher, query_builder, hive_logger, spark, tracker, logger, execution_id, global_ts, out_path):
+        threading.Thread.__init__(self)
+        self.thread_id = thread_id
+        self.name = "Worker-{0:02d}".format(thread_id)
+        self.queue = job_queue
+        self.config = config
+        self.log_parser = log_parser
+        self.hdfs_h = hdfs_h
+        self.meta_fetcher = meta_fetcher
+        self.query_builder = query_builder
+        self.hive_logger = hive_logger
+        self.spark = spark
+        self.tracker = tracker
+        self.logger = logger
+        self.execution_id = execution_id
+        self.global_ts = global_ts
+        self.out_path = out_path
+        self.daemon = True
+
+    def _copy_file_to_nas(self, local_file_path, db, schema, target_file_name):
+        """ Helper method: Copy ไฟล์ไปยัง NAS พร้อมดักจับ Error """
+        nas_dir = os.path.join(self.config.nas_destination, db, schema)
+        nas_file_path = os.path.join(nas_dir, target_file_name)
+
+        try:
+            if not os.path.exists(nas_dir):
+                try: 
+                    os.makedirs(nas_dir)
+                except OSError as e:
+                    import errno
+                    if e.errno != errno.EEXIST:
+                        raise
+
+            shutil.copy2(local_file_path, nas_file_path)
+            return True, None
+
+        except Exception as e:
+            return False, str(e)
+
+    def run(self):
+        while(True):
+            try:
+                task = self.queue.get(block=True, timeout=2)
+            except Queue.Empty:
+                self.tracker.update_worker_status(self.name, "[IDLE] Finished")
+                break
+
+            db = task['db']
+            schema = task['schema']
+            partition = task['partition']
+            start_datetime = datetime.now()
+            start_t = time.time()
+
+            base_table = partition.split('_1_prt_')[0] if '_1_prt_' in partition else partition
+
+            try:
+                self.tracker.update_worker_status(self.name, "[BUSY] {0}".format(partition))                
+                
+                # Step 1: Check Succeed Log
+                log_row, log_msg = self.log_parser.get_latest_succeed_info(db, schema, partition)
+                if not log_row:
+                    raise ValueError("SKIPPED: " + log_msg)
+                
+                local_file_path = log_row.get('File_Path')
+                if self.config.replace_path_from and self.config.replace_path_to:
+                    original_path = local_file_path
+                    local_file_path = local_file_path.replace(self.config.replace_path_from, self.config.replace_path_to)
+                    
+                    if original_path != local_file_path:
+                        self.logger.info("[Worker] Replaced local_file_path from '{0}' to '{1}'".format(original_path, local_file_path))
+
+                # Step 2: HDFS Sync
+                hdfs_dest = os.path.join(self.config.hdfs_path, db, schema, partition)
+                self.hdfs_h.sync_parquet(local_file_path, hdfs_dest)
+
+                # Step 3: Fetch Metadata & Categorize
+                type_map = self.meta_fetcher.fetch_data_types(db, base_table)
+                missing_meta = True if type_map is None else False
+                type_map = type_map or {}
+
+                master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
+                cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': type_map, 
+                            'MANUAL_NUM': master_info['manual_num']}
+                thai_config = self.config.thai_dict.get((db.lower(), partition.lower()), {})
+                if not thai_config:
+                    thai_config = self.config.thai_dict.get((db.lower(), base_table.lower()), {})                
+                
+                if not missing_meta:
+                    for col, gp_dt in type_map.items():
+                        gp_base = gp_dt.split('(')[0].strip().lower()
+                        thai_flag = thai_config.get(col)
+                        if thai_flag == 'Y':
+                            gp_base = 'thai_col_flag_y'
+                        elif thai_flag == 'N':
+                            gp_base = 'thai_col_flag_n'
+                        if gp_base in self.config.type_mapping.get("SUM_MIN_MAX", []): cat_cols['SUM_MIN_MAX'].append(col)
+                        elif gp_base in self.config.type_mapping.get("MIN_MAX", []): cat_cols['MIN_MAX'].append(col)
+                        elif gp_base in self.config.type_mapping.get("MD5_MIN_MAX", []): cat_cols['MD5_MIN_MAX'].append(col)
+
+                # Step 4: Build & Execute SparkSQL Expressions
+                self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
+                df = self.spark.read.parquet(hdfs_dest)
+                agg_exprs = self.query_builder.build_agg_exprs(cat_cols)
+                
+                self.logger.info("Worker {0} executing Spark Action for {1}...".format(self.name, partition))
+                sp_row = df.agg(*agg_exprs).collect()[0]
+                sp_res = sp_row.asDict()
+                self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
+
+                def format_val(v):
+                    if v is None: return None
+                    v_str = str(v)
+                    if 'E' in v_str or 'e' in v_str:
+                        try:
+                            return "{:f}".format(Decimal(v_str))
+                        except Exception:
+                            pass
+                    return v
+                
+                final_json = collections.OrderedDict()
+                final_json["table"] = "{0}.{1}.{2}".format(db, schema, partition)
+                final_json["count"] = int(sp_res.pop("count", 0))
+                final_json["methods"] = collections.OrderedDict()
+                
+                parsed_res = {}
+                for k, v in sp_res.items():
+                    parts = k.split('|')
+                    if len(parts) == 3:
+                        method, col, func = parts
+                        if method not in parsed_res: parsed_res[method] = {}
+                        if col not in parsed_res[method]: parsed_res[method][col] = {}
+                        parsed_res[method][col][func] = format_val(v)
+
+                for method in ["SUM_MIN_MAX", "MIN_MAX", "MD5_MIN_MAX"]:
+                    if method in parsed_res:
+                        final_json["methods"][method] = collections.OrderedDict()
+                        for col in sorted(parsed_res[method].keys()):
+                            final_json["methods"][method][col] = collections.OrderedDict()
+                            for f in ["sum", "min", "max", "min_md5", "max_md5"]:
+                                if f in parsed_res[method][col]:
+                                    final_json["methods"][method][col][f] = parsed_res[method][col][f]
+
+                # Step 5: Write to NAS
+                query_file_name = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, partition, self.global_ts)
+                local_query_file = os.path.join(self.out_path, query_file_name)
+                
+                with open(local_query_file, 'w') as f:
+                    f.write("-- PySpark Aggregation Expressions for {0}\n".format(partition))
+                    for expr in agg_exprs:
+                        f.write(str(expr) + "\n")
+
+                out_file_name = "parquet_{0}_{1}_{2}_{3}.json".format(db, schema, partition, self.global_ts)
+                local_json_file = os.path.join(self.out_path, out_file_name)
+                
+                with open(local_json_file, 'w') as f:
+                    json.dump(final_json, f)
+
+                copy_success, copy_err = self._copy_file_to_nas(local_json_file, db, schema, out_file_name)
+                
+                if copy_success:
+                    self.logger.info("Worker {0} successfully saved local files and copied JSON to NAS for {1}".format(self.name, partition))
+                else:
+                    raise RuntimeError("Failed to copy file to NAS: {0}".format(copy_err))
+
+                # Step 6: Finalize Status
+                duration = time.time() - start_t
+                status = "WARNING" if missing_meta else "SUCCESS"
+                remark = "Metadata Missing (Count-only)" if missing_meta else "JSON Generated"
+                
+                self.tracker.add_result(partition, status, duration, remark)
+                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), duration, status.lower(), remark)
+
+            except ValueError as ve:
+                msg = str(ve)
+                status = "SKIPPED" if "SKIPPED" in msg else "FAILED"
+                self.tracker.add_result(partition, status, time.time() - start_t, msg)
+                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, status.lower(), msg)
+            except Exception as e:
+                err_msg = str(e)
+                self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, repr(e)))
+                self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(err_msg[:50]))
+                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, "failed", err_msg[:200])
+            finally:
+                self.queue.task_done()
+
+class MonitorThread(threading.Thread):
+    def __init__(self, tracker, num_workers, log_path):
+        threading.Thread.__init__(self)
+        self.tracker = tracker
+        self.num_workers = num_workers
+        self.log_path = log_path
+        self.stop_event = threading.Event()
+        self.daemon = True
+        self.first_print = True
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            self.print_dashboard()
+            time.sleep(1)
+        self.print_dashboard()
+
+    def print_dashboard(self):
+        comp, total = self.tracker.get_progress()
+        pct = 100.0 * comp / total if total > 0 else 0
+        elapsed = time.time() - self.tracker.start_time
+
+        lines = []
+        lines.append("============================================================")
+        lines.append(" RECONCILE PARQUET MONITOR (Python 2.7 / PySpark) ")
+        lines.append("============================================================")
+        lines.append(" Progress: {0}/{1} ({2:.2f}%)".format(comp, total, pct))
+        lines.append(" Elapsed : {0:.0f}s".format(elapsed))
+        lines.append("-" * 60)
+
+        workers = sorted(self.tracker.worker_status.keys())
+        for w_name in workers:
+            status = self.tracker.worker_status.get(w_name, "Initializing...")
+            line_str = " {0} : {1}".format(w_name, status)
+            lines.append(line_str[:79]) 
+        
+        lines.append("-" * 60)
+        lines.append(" Log File: {0}".format(self.log_path))
+        lines.append(" Press Ctrl+C to abort.")
+
+        if not self.first_print:
+            sys.stdout.write('\033[F' * len(lines))
+        else:
+            self.first_print = False
+
+        output = "\n".join([line + "\033[K" for line in lines]) + "\n"
+        sys.stdout.write(output)
+        sys.stdout.flush()
+
+# ==============================================================================
+# 5. Main Job Class
+# ==============================================================================
+
+class ParquetQueryJob(object):
+    def __init__(self, args, logger, log_path, global_date_folder, global_ts, main_path, final_out_dir):
+        self.args = args
+        self.logger = logger
+        self.log_path = log_path
+        self.global_ts = global_ts
+        self.out_path = final_out_dir
+        self.tracker = ProcessTracker(logger)
+
+        self.config = ConfigManager(args.env, args.master, args.map, args.list, args.table_name, logger)
+
+        self.logger.info("Initializing SparkSession with FAIR scheduler...")
+        self.spark = SparkSession.builder.appName("script_reconcile_query_parquet") \
+            .config("spark.scheduler.mode", "FAIR").enableHiveSupport().getOrCreate()
+        self.spark.sparkContext.setLogLevel("ERROR")
+        self.execution_id = self.spark.sparkContext.applicationId
+
+        # Init Handlers
+        self.log_parser = LogParser(self.config.succeed_path, logger)
+        self.hdfs_h = HDFSHandler(self.spark, logger)
+        self.meta_fetcher = MetadataFetcher(self.config.metadata_base_dir, logger)
+        self.query_builder = SparkQueryBuilder(self.config.env_params, self.config.type_mapping, logger)
+        self.hive_logger = HiveLogger(self.spark, logger)
+
+        self.job_queue = Queue.Queue()
+        for task in self.config.execution_list: self.job_queue.put(task)
+        self.tracker.set_total_task(len(self.config.execution_list))
+
+    def run(self):
+        num_workers = int(self.args.concurrency)
+        workers = []
+        for i in range(num_workers):
+            w = Worker(i+1, self.job_queue, self.config, self.log_parser, self.hdfs_h, self.meta_fetcher, 
+                       self.query_builder, self.hive_logger, self.spark, self.tracker, self.logger, self.execution_id, self.global_ts, self.out_path)
+            workers.append(w)
+            w.start()
+
+        monitor = MonitorThread(self.tracker, num_workers, self.log_path)
+        monitor.start()
+
+        try:
+            self.job_queue.join()
+            for w in workers: w.join()
+        except KeyboardInterrupt:
+            sys.stdout.write("\n\n>>> ABORTING SCRIPT... <<<\n\n")
+            sys.stdout.flush()
+        finally:
+            monitor.stop()
+            monitor.join()
+            self.spark.stop()
+            self.tracker.print_summary(self.log_path, self.config.nas_destination)
+
+if __name__ == "__main__":
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    main_path = os.path.dirname(current_script_dir)
+
+    parser = argparse.ArgumentParser(description='Parquet JSON Query Builder')
+    parser.add_argument('--env', default='env_config.txt')
+    parser.add_argument('--master', default='config_master.txt')
+    parser.add_argument('--map', default='data_type_mapping.json')
+    parser.add_argument('--list', default='list_table.txt')
+    parser.add_argument('--table_name', help='Specific tables to run (DB|Schema.Partition)')
+    parser.add_argument('--concurrency', default=4, type=int)
+    args = parser.parse_args()
+
+    args.env = os.path.join(main_path, 'config', os.path.basename(args.env))
+    args.master = os.path.join(main_path, 'config', os.path.basename(args.master))
+    args.map = os.path.join(main_path, 'config', os.path.basename(args.map))
+    args.list = os.path.join(main_path, 'config', os.path.basename(args.list))
+
+    run_datetime = datetime.now()
+    global_date_folder = run_datetime.strftime("%Y%m%d")
+    global_ts = run_datetime.strftime("%Y%m%d_%H%M%S")
+
+    final_log_dir = os.path.join(main_path, 'log', global_date_folder)
+    final_out_dir = os.path.join(main_path, 'output', global_date_folder)
+
+    if not os.path.exists(final_out_dir):
+        try:
+            os.makedirs(final_out_dir)
+        except OSError as e:
+            print("WARNING: Could not create output directory '{0}'. Using current directory. Error: {1}".format(final_out_dir, e))
+    
+    logger, log_path = setup_logging(final_log_dir, 'reconcile_query_parquet', global_ts)
+    logger.info("Started Reconcile script with concurrency: {0}".format(args.concurrency))
+
+    try:
+        job = ParquetQueryJob(args, logger, log_path, global_date_folder, global_ts, main_path, final_out_dir)
+        job.run()
+    except Exception as e:
+        logger.critical("Job aborted due to critical error: {0}".format(e), exc_info=True)
+        sys.exit(1)
