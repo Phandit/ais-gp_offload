@@ -1,3 +1,2 @@
-# DB | SCHEMA | TABLE | manual_num_cols | manual_thai_cols
-prod_mis_drm|public|table_A|col_id,col_amount|col_thai_name
-prod_mis_drm|public|table_B|none|none
+# DB | SCHEMA | TABLE | manual_num_cols
+prodgp|prod_mis_drm|drm_handset_campaign_source_tdm|no_of_hs_contact_prev_campaign

@@ -1,9 +1,13 @@
-local_temp_dir=/data/AIS-EDW/gpoffload/script_reconcile_query_greenplum/temp/
+local_temp_dir=/data/AIS-EDW/gpoffload/script_reconcile_query_greenplum/output/
 nas_destination=/MNT/GP_DWS/mig_reconcile_query_gp_output
 log_dir=/data/AIS-EDW/gpoffload/script_reconcile_query_greenplum/log
 metadata_base_dir=/MNT/GP_DWS/mig_table_info
-mapping_file_path=/data/AIS-EDW/gpoffload/script_reconcile_query_greenplum/config/data_type_mapping.json
-
+config_master_file_path=/MNT/GP_DWS/mig_reconcile_config/config_master.txt
+mapping_file_path=/MNT/GP_DWS/mig_reconcile_config/data_type_mapping.json
+succeed_path=/MNT/GP_DWS/mig_stat_log
+gp_db=prodgp
+thai_mapping_table=gpoffload.gp_list_th_col
+thai_mapping_export_path=/data/AIS-EDW/gpoffload/script_reconcile_query_greenplum/temp/thai_mapping_export.csv
 # --- Number Solution Default Config ---
 default_numeric_p=38
 default_numeric_s=10
