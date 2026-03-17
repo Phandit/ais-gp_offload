@@ -307,6 +307,16 @@ class Config(object):
                     self.type_mapping = json.load(f)
             except Exception as e:
                 self.logger.error("Failed to parse mapping file: {0}. Using empty map.".format(e))
+            
+            # Check if datatype repeats in more than 1 method
+            self.repeat_data_type = (
+                (set(self.type_mapping['SUM_MIN_MAX']) & set(self.type_mapping['MIN_MAX'])) |
+                (set(self.type_mapping['SUM_MIN_MAX']) & set(self.type_mapping['MD5_MIN_MAX'])) |
+                (set(self.type_mapping['MIN_MAX']) & set(self.type_mapping['MD5_MIN_MAX']))
+                )
+            if self.repeat_data_type:
+                self.logger.error("Mapping file has repeat datatype: {0} in many method.".format(self.repeat_data_type))
+                raise
         else:
             self.logger.warning("Mapping file not found or path not defined: {0}".format(self.mapping_file_path))
 
