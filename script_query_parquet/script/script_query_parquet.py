@@ -17,6 +17,7 @@ import shutil
 import collections
 from decimal import Decimal
 from datetime import datetime
+import uuid
 
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
@@ -154,9 +155,12 @@ def setup_logging(log_dir, log_name="app", timestamp=None):
 # ==============================================================================
 
 class ConfigManager(object):
-    def __init__(self, env_config_path, master_config_path, map_config_path, list_file_path, cli_tables, logger, global_date_folder):
+    def __init__(self, env_config_path, master_config_path, map_config_path, list_file_path, cli_tables, logger, global_date_folder, run_id, global_ts, main_path):
         self.logger = logger
         self.global_date_folder = global_date_folder
+        self.run_id = run_id
+        self.global_ts = global_ts
+        self.main_path = main_path
 
         self.logger.info("Loading environment config: {0}".format(env_config_path))
         self.succeed_path = ''
@@ -277,6 +281,8 @@ class ConfigManager(object):
 
     def _export_thai_mapping(self):
         target_tables = set(["{0}.{1}".format(t['schema'], t['partition']) for t in self.execution_list])
+        thai_mapping_export_filenm = "thai_mapping_export_{0}_{1}.csv".format(self.global_ts, self.run_id)
+        self.thai_mapping_export_full_path = os.path.join(self.thai_mapping_export_path, thai_mapping_export_filenm)
         if not target_tables:
             return True
         
@@ -284,49 +290,104 @@ class ConfigManager(object):
         in_clause = ",".join(table_list)
         
         sql_query = "\\copy (SELECT database_name, original_table_name, th_column_name, COALESCE(active_flag,'Y') FROM {0} WHERE original_table_name IN ({1})) TO '{2}' WITH CSV HEADER;".format(
-            self.thai_mapping_table, in_clause, self.thai_mapping_export_path)
-        self.logger.info("Generated SQL Query for Thai Mapping: {0}".format(sql_query))
-        cmd = [
-            'psql',
-            '-d', self.gp_db,
-            '-c', sql_query
-        ]
+            self.thai_mapping_table, in_clause, self.thai_mapping_export_full_path)
+        #self.logger.info("Generated SQL Query for Thai Mapping: {0}".format(sql_query))
+        #cmd = [
+        #    'psql',
+        #    '-d', self.gp_db,
+        #    '-c', sql_query
+        #]
 
-        self.logger.info("Executing subprocess to export Thai mapping to {0}".format(self.thai_mapping_export_path))
+        filename = "query_export_thai_mapping_{0}_{1}.sql".format(self.global_ts, self.run_id)
+        filepath = os.path.join(self.thai_mapping_export_path, filename)
+
+        with open(filepath, 'w') as f:
+            f.write(sql_query)
+            f.write("\n")
+
+        self.logger.info("Generated SQL for Thai Mapping: {0}".format(filepath))
+        cmd = ['psql', '-v', 'ON_ERROR_STOP=1', '-d', self.gp_db, '-f', filepath]
+        self.logger.info("Executing PSQL... (DB: {0}) -> Output: {1}".format(self.gp_db, self.thai_mapping_export_full_path))
+        self.logger.info("{0}".format(" ".join(cmd)))
+
+        self.logger.info("Executing subprocess to export Thai mapping to {0}".format(self.thai_mapping_export_full_path))
+        #try:
+        #    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        #    stdout, stderr = process.communicate()
+        #    
+        #    if process.returncode == 0:
+        #        self.logger.info("Export Thai mapping via psql successful.")
+        #        return True
+        #    else:
+        #        self.logger.error("psql export failed:\n{0}".format(stderr.decode('utf-8', errors='ignore')))
+        #        return False
+        #except Exception as e:
+        #    self.logger.error("Failed to execute psql subprocess: {0}".format(e))
+        #    return False
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
             
+            try:
+                stderr_text = stderr.decode('utf-8')
+            except Exception:
+                stderr_text = str(stderr)
+            
             if process.returncode == 0:
                 self.logger.info("Export Thai mapping via psql successful.")
                 return True
-            else:
-                self.logger.error("psql export failed:\n{0}".format(stderr.decode('utf-8', errors='ignore')))
+            if process.returncode != 0:
+                err_msg = "PSQL execution failed (Return Code: {0}) Error: {1}".format(process.returncode, stderr_text)
+                self.logger.error(err_msg)
                 return False
+            if not (os.path.exists(self.thai_mapping_export_full_path) and os.path.getsize(self.thai_mapping_export_full_path) > 0):
+                err_msg = "PSQL executed but output file missing or empty: {0} Error: {1}".format(self.thai_mapping_export_full_path, stderr_text)
+                self.logger.error(err_msg)
+                return False
+            
         except Exception as e:
-            self.logger.error("Failed to execute psql subprocess: {0}".format(e))
+            err_msg = "Unexpected error when running psql: {0}".format(e).replace("\n", " ")
+            self.logger.error(err_msg)
             return False
         
+    #def _load_thai_mapping(self):
+    #    if not os.path.exists(self.thai_mapping_export_full_path):
+    #        self.logger.warning("Thai mapping file not found at {0}".format(self.thai_mapping_export_full_path))
+    #        return
+    #    
+    #    try:
+    #        with open(self.thai_mapping_export_full_path, 'r') as f:
+    #            reader = csv.DictReader(f)
+    #            for row in reader:
+    #                db = row.get('database_name', '').strip().lower()
+    #                tbl_raw = row.get('original_table_name', '').strip().lower()
+    #                if '.' in tbl_raw:
+    #                    tbl = tbl_raw.split('.')[-1]
+    #                else:
+    #                    tbl = tbl_raw
+    #                col = row.get('th_column_name', '').strip().lower()
+    #                flag = row.get('active_flag', '').strip().upper()
+    #                if db and tbl and col:
+    #                    if (db, tbl) not in self.thai_dict:
+    #                        self.thai_dict[(db, tbl)] = {}
+    #                    self.thai_dict[(db, tbl)][col] = flag
+    #        self.logger.info("Loaded Thai mapping configuration for {0} tables.".format(len(self.thai_dict)))
+    #    except Exception as e:
+    #        self.logger.error("Error loading Thai mapping CSV: {0}".format(e))
+
     def _load_thai_mapping(self):
-        if not os.path.exists(self.thai_mapping_export_path):
-            self.logger.warning("Thai mapping file not found at {0}".format(self.thai_mapping_export_path))
-            return
-        
+        if not os.path.exists(self.thai_mapping_export_full_path): return
         try:
-            with open(self.thai_mapping_export_path, 'r') as f:
+            with open(self.thai_mapping_export_full_path, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     db = row.get('database_name', '').strip().lower()
                     tbl_raw = row.get('original_table_name', '').strip().lower()
-                    if '.' in tbl_raw:
-                        tbl = tbl_raw.split('.')[-1]
-                    else:
-                        tbl = tbl_raw
+                    tbl = tbl_raw.split('.')[-1] if '.' in tbl_raw else tbl_raw
                     col = row.get('th_column_name', '').strip().lower()
                     flag = row.get('active_flag', '').strip().upper()
                     if db and tbl and col:
-                        if (db, tbl) not in self.thai_dict:
-                            self.thai_dict[(db, tbl)] = {}
+                        if (db, tbl) not in self.thai_dict: self.thai_dict[(db, tbl)] = {}
                         self.thai_dict[(db, tbl)][col] = flag
             self.logger.info("Loaded Thai mapping configuration for {0} tables.".format(len(self.thai_dict)))
         except Exception as e:
@@ -456,7 +517,9 @@ class LogParser(object):
                 self.logger.info("[LogParser] Building memory cache for DB: {0}, Schema: {1} ...".format(db, schema))
                 self.cache[cache_key] = {}
                 
-                search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
+                
+                #search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
+                search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat.{0}.csv".format(schema))
                 # search_pattern = os.path.join(self.succeed_base_path, db, "backup_old_file", "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
                 self.logger.info("[LogParser] Searching for succeed log using pattern: {0}".format(search_pattern))
                 matched_files = sorted(glob.glob(search_pattern), reverse=True)
@@ -611,7 +674,7 @@ class HiveLogger(object):
 # ==============================================================================
 
 class Worker(threading.Thread):
-    def __init__(self, thread_id, job_queue, config, log_parser, hdfs_h, meta_fetcher, query_builder, hive_logger, spark, tracker, logger, execution_id, global_ts, out_path):
+    def __init__(self, thread_id, job_queue, config, log_parser, hdfs_h, meta_fetcher, query_builder, hive_logger, spark, tracker, logger, execution_id, global_ts, out_path, run_id):
         threading.Thread.__init__(self)
         self.thread_id = thread_id
         self.name = "Worker-{0:02d}".format(thread_id)
@@ -629,6 +692,7 @@ class Worker(threading.Thread):
         self.global_ts = global_ts
         self.out_path = out_path
         self.daemon = True
+        self.run_id = run_id
 
     def _copy_file_to_nas(self, local_file_path, db, schema, target_file_name):
         """ Helper method: Copy ไฟล์ไปยัง NAS พร้อมดักจับ Error """
@@ -852,16 +916,17 @@ class MonitorThread(threading.Thread):
 # ==============================================================================
 
 class ParquetQueryJob(object):
-    def __init__(self, args, logger, log_path, global_date_folder, global_ts, main_path, final_out_dir):
+    def __init__(self, args, logger, log_path, global_date_folder, global_ts, main_path, final_out_dir, run_id):
         self.args = args
         self.logger = logger
         self.log_path = log_path
         self.global_ts = global_ts
+        self.run_id = run_id
         self.out_path = final_out_dir
         self.tracker = ProcessTracker(logger)
         self.global_date_folder = global_date_folder
 
-        self.config = ConfigManager(args.env, args.master, args.map, args.list, args.table_name, logger, self.global_date_folder)
+        self.config = ConfigManager(args.env, args.master, args.map, args.list, args.table_name, logger, self.global_date_folder, self.run_id, self.global_ts, main_path)
 
         self.logger.info("Initializing SparkSession with FAIR scheduler...")
         self.spark = SparkSession.builder.appName("script_reconcile_query_parquet") \
@@ -885,7 +950,7 @@ class ParquetQueryJob(object):
         workers = []
         for i in range(num_workers):
             w = Worker(i+1, self.job_queue, self.config, self.log_parser, self.hdfs_h, self.meta_fetcher, 
-                       self.query_builder, self.hive_logger, self.spark, self.tracker, self.logger, self.execution_id, self.global_ts, self.out_path)
+                       self.query_builder, self.hive_logger, self.spark, self.tracker, self.logger, self.execution_id, self.global_ts, self.out_path, self.run_id)
             workers.append(w)
             w.start()
 
@@ -925,6 +990,7 @@ if __name__ == "__main__":
     run_datetime = datetime.now()
     global_date_folder = run_datetime.strftime("%Y%m%d")
     global_ts = run_datetime.strftime("%Y%m%d_%H%M%S")
+    run_id = str(uuid.uuid4().hex)
 
     final_log_dir = os.path.join(main_path, 'log', global_date_folder)
     final_out_dir = os.path.join(main_path, 'output', global_date_folder)
@@ -937,9 +1003,10 @@ if __name__ == "__main__":
     
     logger, log_path = setup_logging(final_log_dir, 'reconcile_query_parquet', global_ts)
     logger.info("Started Reconcile script with concurrency: {0}".format(args.concurrency))
+    logger.info("Run ID: {0}".format(run_id))
 
     try:
-        job = ParquetQueryJob(args, logger, log_path, global_date_folder, global_ts, main_path, final_out_dir)
+        job = ParquetQueryJob(args, logger, log_path, global_date_folder, global_ts, main_path, final_out_dir, run_id)
         job.run()
     except Exception as e:
         logger.critical("Job aborted due to critical error: {0}".format(e), exc_info=True)
