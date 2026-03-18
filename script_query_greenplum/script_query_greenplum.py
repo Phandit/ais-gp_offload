@@ -1,6 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+#-- Input File Pattern --#
+# <database>|<schema>.<table>
+
+#-- Stat File Columns --#
+# 1) greenplum_tbl
+# 2) start_timestamp
+# 3) end_timestamp
+# 4) duration
+# 5) reconcile_method
+# 6) run_status
+# 7) error_message
+# 8) json_output_path
+# 9) remark
+
+
 import sys
 import os
 import csv
@@ -779,6 +794,7 @@ class Worker(threading.Thread):
         status = getattr(self, "status", "")
         error_message = getattr(self, "error_message", "")
         reconcile_method = getattr(self, "reconcile_method", [])
+        json_output_path = getattr(self, "json_output_path_file", "")
 
         # Prepare timing
         end_time_tbl = time.time()
@@ -804,6 +820,7 @@ class Worker(threading.Thread):
             reconcile_method_str,
             status,
             error_message,
+            json_output_path,
             ""  # remark
         ]
         row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
@@ -934,9 +951,11 @@ class Worker(threading.Thread):
                         sql_file = self.builder.build_json_query(self.db, self.schema, table, cat_cols, insert_logic_dict)
                         output_filename = "gp_{0}_{1}_{2}_{3}.json".format(self.db, self.schema, table, self.global_ts)
                         local_path = os.path.join(self.config.local_temp_dir, output_filename)
+                        json_output_dir = os.path.join(self.config.nas_dest_base, self.db, self.schema)
+                        self.json_output_path_file = os.path.join(json_output_dir, output_filename)
                         
                         self.shell.run_psql(sql_file, local_path, self.db)
-                        self.file_h.copy_to_nas(local_path, os.path.join(self.config.nas_dest_base, self.db, self.schema))
+                        self.file_h.copy_to_nas(local_path, json_output_dir)
 
                         if manual_num_err:
                             self.status = "FAILED"
