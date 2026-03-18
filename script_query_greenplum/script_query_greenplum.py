@@ -590,7 +590,7 @@ class QueryBuilder(object):
 
             # 2. DATE Solution
             for col in sorted(all_date_cols):
-                gp_type = categorized_cols['TYPE_MAP'].get(col, 'text') #fncheck#
+                gp_type = categorized_cols['TYPE_MAP'].get(col, 'text')
                 base_expr = insert_logic_dict.get(col, '"{0}"'.format(col))
                 min_expr = "MIN({0})::text".format(base_expr)
                 max_expr = "MAX({0})::text".format(base_expr)
