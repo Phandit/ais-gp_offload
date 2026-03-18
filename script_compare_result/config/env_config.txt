@@ -1,0 +1,6 @@
+succeed_log_gp_path=/home/MNT_NFS/GP_DWS/mig_reconcile_query_gp_output/
+succeed_log_pq_path=/home/MNT_NFS/GP_DWS/mig_reconcile_query_parquet_output/
+
+compare_report_path=/path/to/nas/output/compare_reports/
+hive_header_table=default.compare_header_log
+hive_detail_table=default.compare_detail_log
