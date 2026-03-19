@@ -25,7 +25,7 @@
 !/script_query_greenplum/config/env_config.txt
 !/script_compare_result/config/env_config.txt
 !/script_compare_result/script/script_compare_result.py
-!/script_compare_result/script/run_script_parquet.sh
+
 
 # หากต้องการเก็บไฟล์ทั้งหมดในโฟลเดอร์ config ให้ใช้แบบนี้
 !/script_query_greenplum/config/
