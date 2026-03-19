@@ -239,6 +239,8 @@ class ConfigManager(object):
         # 2. Load Target Tables (Moved up before Thai mapping logic to build IN clause)
         self.execution_list = []
         self.invalid_tables = []
+        seen_tables = set()
+
         if cli_tables:
             self.logger.info("Using CLI arguments for table list.")
             tables = cli_tables.split(',')
@@ -247,10 +249,15 @@ class ConfigManager(object):
                     db_part, tbl_part = t.split('|')
                     sch_part, real_tbl = tbl_part.split('.')
                     if db_part and sch_part and real_tbl:
+                        table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                        if table_key in seen_tables:
+                            self.logger.warning("Duplicate table found and removed: {0}".format(t.strip()))
+                            continue
+                        seen_tables.add(table_key)
                         self.execution_list.append({
-                            'db': db_part.strip(),
-                            'schema': sch_part.strip(),
-                            'partition': real_tbl.strip()
+                            'db': table_key[0],
+                            'schema': table_key[1],
+                            'partition': table_key[2]
                         })
                     else:
                         self.logger.error("Invalid format in argument: {0}. Expected DB|Schema.Table".format(t))
@@ -270,10 +277,15 @@ class ConfigManager(object):
                             db_part, tbl_part = line.split('|')
                             sch_part, real_tbl = tbl_part.split('.')
                             if db_part and sch_part and real_tbl:
+                                table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                                if table_key in seen_tables:
+                                    self.logger.warning("Duplicate table found and removed in list file: {0}".format(line))
+                                    continue
+                                seen_tables.add(table_key)
                                 self.execution_list.append({
-                                    'db': db_part.strip(),
-                                    'schema': sch_part.strip(),
-                                    'partition': real_tbl.strip()
+                                    'db': table_key[0],
+                                    'schema': table_key[1],
+                                    'partition': table_key[2]
                                 })
                             else:
                                 self.logger.error("Skipping invalid line in list file: {0}. Expected DB|Schema.Table".format(line))
@@ -1422,6 +1434,11 @@ if __name__ == "__main__":
     parser.add_argument('--concurrency', default=4, type=int)
     args = parser.parse_args()
 
+    # Reject if user tries to provide both target inputs explicitly
+    if '--list' in sys.argv and '--table_name' in sys.argv:
+        print("ERROR: Please use either --list or --table_name")
+        sys.exit(1)
+
     def resolve_config_path(input_path, base_dir):
         if not input_path: return input_path
         if os.path.isabs(input_path):
@@ -1456,4 +1473,10 @@ if __name__ == "__main__":
         job.run()
     except Exception as e:
         logger.critical("Job aborted due to critical error: {0}".format(e), exc_info=True)
+        print("\n" + "!" * 80)
+        print("CRITICAL FAILURE")
+        print("The script was aborted due to a critical error.")
+        print("Please check the log file for detailed information:")
+        print("Log File Location: {0}".format(os.path.abspath(log_path)))
+        print("!" * 80 + "\n")
         sys.exit(1)
