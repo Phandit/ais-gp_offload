@@ -18,6 +18,7 @@ import collections
 from decimal import Decimal
 from datetime import datetime
 import uuid
+import errno
 
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
@@ -155,12 +156,11 @@ def setup_logging(log_dir, log_name="app", timestamp=None):
 # ==============================================================================
 
 class ConfigManager(object):
-    def __init__(self, env_config_path, master_config_path, map_config_path, list_file_path, cli_tables, logger, global_date_folder, run_id, global_ts, main_path):
+    def __init__(self, env_config_path, master_config_path, map_config_path, list_file_path, cli_tables, logger, global_date_folder, run_id, global_ts, main_path=None):
         self.logger = logger
         self.global_date_folder = global_date_folder
         self.run_id = run_id
         self.global_ts = global_ts
-        self.main_path = main_path
 
         self.logger.info("Loading environment config: {0}".format(env_config_path))
         self.succeed_path = ''
@@ -173,6 +173,11 @@ class ConfigManager(object):
         self.thai_mapping_table = ''
         self.thai_mapping_export_path = ''
         self.thai_dict = {}
+
+        self.local_temp_dir = os.path.join(main_path, 'temp', 'output')
+        #self.nas_dest_base = os.path.join(main_path, 'output')
+        #self.log_dir = os.path.join(main_path, 'log')
+
 
         self.env_params = {
             'default_numeric_p': 38, 'default_numeric_s': 10,
@@ -191,7 +196,8 @@ class ConfigManager(object):
                         key, value = line.split('=', 1)
                         key = key.strip()
                         value = value.strip()
-                        if key == 'succeed_path': self.succeed_path = value
+                        if key == 'local_temp_dir': self.local_temp_dir = value
+                        elif key == 'succeed_path': self.succeed_path = value
                         elif key =='hdfs_path': self.hdfs_path = value
                         elif key == 'replace_path_from': self.replace_path_from = value
                         elif key == 'replace_path_to': self.replace_path_to = value
@@ -211,6 +217,24 @@ class ConfigManager(object):
         # Create temp dir if not exists
         if self.nas_destination:
                 self.nas_destination = os.path.join(self.nas_destination, self.global_date_folder)
+
+        # Create temp dir if not exists
+        if self.local_temp_dir is None:
+            log_msg = "local_temp_dir is not defined in env_config.txt"
+            self.logger.error(log_msg)
+            raise ValueError("Error: " + log_msg)
+        else:
+            self.local_temp_dir = os.path.join(self.local_temp_dir, self.global_date_folder)
+            if not os.path.exists(self.local_temp_dir):
+                os.makedirs(self.local_temp_dir)
+        
+        self.logger.info("Resolved local_temp_dir: {0}".format(self.local_temp_dir))
+        self.logger.info("Resolved nas_destination: {0}".format(self.nas_destination))
+        #self.logger.info("Resolved log_dir: {0}".format(self.log_dir))
+        self.logger.info("Resolved metadata_base_dir: {0}".format(self.metadata_base_dir))
+        self.logger.info("Resolved mapping_file_path: {0}".format(self.mapping_file_path))
+        self.logger.info("Resolved succeed_path: {0}".format(self.succeed_path))
+        
 
         # 2. Load Target Tables (Moved up before Thai mapping logic to build IN clause)
         self.execution_list = []
@@ -565,11 +589,12 @@ class SparkQueryBuilder(object):
         all_date_cols = set(cat_cols['MIN_MAX'])
         all_cpx_cols = set(cat_cols['MD5_MIN_MAX'])
 
-        for col in all_num_cols:
-            all_date_cols.discard(col)
-            all_cpx_cols.discard(col)
-        for col in all_date_cols:
-            all_cpx_cols.discard(col)
+        # Discard Logic (Prevent Duplicates)
+        #for col in all_num_cols:
+        #    all_date_cols.discard(col)
+        #    all_cpx_cols.discard(col)
+        #for col in all_date_cols:
+        #    all_cpx_cols.discard(col)
         
         # 1. SUM_MIN_MAX
         for col in all_num_cols:
@@ -775,12 +800,58 @@ class HiveLogger(object):
         except Exception as e:
             self.logger.warning("Hive Log Insert Failed: {0}".format(e))
 
+
+#class FileHandler(object):
+#    def __init__(self, logger):
+#        self.logger = logger
+#    def copy_to_nas(self, src, dest_dir):
+#        if not os.path.exists(dest_dir):
+#            try:
+#                os.makedirs(dest_dir)
+#            except OSError:
+#                pass
+#        self.logger.info("Copying file from {0} to NAS: {1}".format(src, dest_dir))
+#        shutil.copy2(src, dest_dir)
+
+
+class FileHandler(object):
+    def __init__(self, logger):
+        self.logger = logger
+
+    def copy_to_nas(self, src, dest_dir):
+        # 1. Check if source exists first to avoid confusing errors
+        if not os.path.exists(src):
+            self.logger.error("Source file not found: {0}".format(src))
+            return False
+
+        # 2. Hardened directory creation
+        if not os.path.exists(dest_dir):
+            try:
+                os.makedirs(dest_dir)
+            except OSError as e:
+                # Ignore if directory was created by another process/thread
+                if e.errno != errno.EEXIST:
+                    self.logger.error("Critical: Cannot create NAS directory {0}. Error: {1}".format(dest_dir, e))
+                    return False
+            except Exception as e:
+                self.logger.error("Unexpected error creating NAS directory: {0}".format(e))
+                return False
+
+        # 3. Perform copy with metadata preservation
+        try:
+            self.logger.info("Copying file from {0} to NAS: {1}".format(src, dest_dir))
+            shutil.copy2(src, dest_dir)
+            return True
+        except Exception as e:
+            self.logger.error("Failed to copy file to NAS: {0}".format(e))
+            return False
+
 # ==============================================================================
 # 4. Parallel Workers & Monitor
 # ==============================================================================
 
 class Worker(threading.Thread):
-    def __init__(self, thread_id, job_queue, config, log_parser, hdfs_h, meta_fetcher, query_builder, hive_logger, spark, tracker, logger, execution_id, global_ts, out_path, abort_event, run_id):
+    def __init__(self, thread_id, job_queue, config, log_parser, hdfs_h, meta_fetcher, query_builder, hive_logger, spark, tracker, logger, execution_id, global_ts, out_path, abort_event, run_id, status_file_filenm, status_file_locks, status_file_locks_lock, file_h):
         threading.Thread.__init__(self)
         self.thread_id = thread_id
         self.name = "Worker-{0:02d}".format(thread_id)
@@ -800,6 +871,20 @@ class Worker(threading.Thread):
         self.abort_event = abort_event
         self.daemon = True
         self.run_id = run_id
+        self.file_h = file_h
+
+        # csv file name
+        self.status_file_filenm = status_file_filenm
+        self.status_file_locks = status_file_locks
+        self.status_file_locks_lock = status_file_locks_lock
+
+        # pre-defined logging info
+        self.start_time_tbl = None
+        self.start_ts_tbl = None
+        self.short_name = ""
+        self.reconcile_method = []
+        self.status = ""
+        self.error_message = ""
 
     def _copy_file_to_nas(self, local_file_path, db, schema, target_file_name):
         nas_dir = os.path.join(self.config.nas_destination, db, schema)
@@ -810,7 +895,7 @@ class Worker(threading.Thread):
                 try: 
                     os.makedirs(nas_dir)
                 except OSError as e:
-                    import errno
+                    #import errno
                     if e.errno != errno.EEXIST:
                         raise
 
@@ -819,6 +904,93 @@ class Worker(threading.Thread):
 
         except Exception as e:
             return False, str(e)
+
+    def logging_status(self, status, remark=""):
+        # 1. Define directory path
+        # temp status directory: <temp>/<date>/stat_csv/<db>/<schema>
+        status_dir = os.path.join(self.config.local_temp_dir, 'stat_csv', self.db, self.schema)
+        self.logger.info("[{0}] Logging status to directory: {1}".format(self.name, status_dir))
+        #self.status = status
+
+        remark = "-" if status.upper() == "SUCCESS" else remark
+
+        # 2. Directory creation with Race Condition handling
+        if not os.path.exists(status_dir):
+            try:
+                os.makedirs(status_dir)
+            except OSError as e:
+                # errno.EEXIST is Error code 17 (File exists)
+                # If the directory was created by another thread just now, ignore the error
+                if e.errno != errno.EEXIST:
+                    self.logger.critical("Cannot create directory {0}. Error: {1}".format(status_dir, e))
+                    return
+            except Exception as e:
+                self.logger.error("Unexpected error creating directory: {0}".format(e))
+                return
+        self.logger.info("[{0}] Directory created successfully: {1}".format(self.name, status_dir))
+
+        status_file_full_path = os.path.join(status_dir, self.status_file_filenm)
+
+        # 3. Thread-safe lock acquisition (Optimized using setdefault)
+        # Acquire or create a per-file lock (shared across all workers) to prevent race conditions
+        with self.status_file_locks_lock:
+            lock = self.status_file_locks.setdefault(status_file_full_path, threading.Lock())
+        self.logger.info("[{0}] Acquired lock for file: {1}".format(self.name, status_file_full_path))
+
+        # 4. Attribute retrieval with getattr
+        short_name = getattr(self, "short_name", "")
+        start_ts = getattr(self, "start_ts_tbl", "")
+        #status = getattr(self, "status", "")
+        #error_message = getattr(self, "error_message", "").replace('\n', ' ')
+        json_output_path = getattr(self, "local_json_file", "")
+        reconcile_method = getattr(self, "reconcile_method", [])
+        self.logger.info("[{0}] Retrieved attributes for logging. Short Name: {1}, Start TS: {2}, Status: {3}".format(
+            self.name, short_name, start_ts, status
+        ))
+
+        # 5. Timing & Duration calculation
+        curr_time = time.time()
+        start_time = getattr(self, "start_time_tbl", None)
+
+        if start_time is not None:
+            duration_sec = int(max(0, curr_time - start_time))
+        else:
+            duration_sec = 0
+
+        hours, rem = divmod(duration_sec, 3600)
+        minutes, seconds = divmod(rem, 60)
+        duration_str = "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
+        end_ts = datetime.fromtimestamp(curr_time).strftime("%Y-%m-%d %H:%M:%S")
+        self.logger.info("[{0}] Calculated duration: {1}".format(self.name, duration_str))
+
+
+        # 6. Reconcile method formatting
+        reconcile_method_str = ",".join(set(reconcile_method)) if reconcile_method else ""
+
+        # 7. Construct and encode row
+        row = [
+            short_name, 
+            start_ts, end_ts, 
+            duration_str, 
+            reconcile_method_str, 
+            status, 
+            remark, 
+            json_output_path, 
+            "" # remark
+            ] 
+
+        row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
+
+        self.logger.info("Prepared log row for {0}: {1}".format(self.name, row))
+
+        # 8. Thread-safe file writing (Using binary mode 'ab' for Python 2.7)
+        with lock:
+            try:
+                with open(status_file_full_path, "ab") as f:
+                    writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+                    writer.writerow(row)
+            except Exception as e:
+                self.logger.critical("Error writing to CSV: {0}".format(e))
 
     def _check_manual_num(self, master_info, type_map):
         self.logger.info("DEBUG: master_info = {0}".format(master_info))
@@ -829,19 +1001,19 @@ class Worker(threading.Thread):
             lookup_col = col.strip().lower()
             datatype = type_map.get(lookup_col)
             if datatype is None:
-                err_msg = "Column: {0} is not found in data type file".format(col)
-                self.logger.error("[{0}] {1}".format(self.name, err_msg))
-                manual_num_err.append(err_msg)
+                remark = "Column: {0} is not found in data type file".format(col)
+                self.logger.error("[{0}] {1}".format(self.name, remark))
+                manual_num_err.append(remark)
                 continue
             
             base_datatype = datatype.split('(')[0].strip().lower()
             if base_datatype in ['bigint', 'integer', 'int']:
                 new_master_info['manual_num'].append(col)
             else:
-                err_msg = "Column: {0} is NOT bigint or integer (data type = {1})".format(col, datatype)
-                self.logger.error("[{0}] {1}".format(self.name, err_msg))
-                manual_num_err.append(err_msg)
-                
+                remark = "Column: {0} is NOT bigint or integer (data type = {1})".format(col, datatype)
+                self.logger.error("[{0}] {1}".format(self.name, remark))
+                manual_num_err.append(remark)
+
         self.logger.info("DEBUG: new_master_info = {0}".format(new_master_info))
         return new_master_info, manual_num_err
 
@@ -861,6 +1033,18 @@ class Worker(threading.Thread):
             partition = task['partition']
             start_datetime = datetime.now()
             start_t = time.time()
+
+            table = task['partition'].strip().lower()
+            full_name = "{0}.{1}.{2}".format(db, schema, table)
+
+            # pre-defined logging info
+            self.db = db
+            self.schema = schema
+            self.short_name = "{0}.{1}".format(self.schema, table)
+            self.start_time_tbl = start_t
+            self.start_ts_tbl = datetime.fromtimestamp(start_t).strftime("%Y-%m-%d %H:%M:%S")
+            #self.status = "PROCESSING"
+            self.reconcile_method = ['count']
 
             base_table = partition.split('_1_prt_')[0] if '_1_prt_' in partition else partition
 
@@ -912,9 +1096,16 @@ class Worker(threading.Thread):
                             gp_base = 'thai_col_flag_y'
                         elif thai_flag == 'N':
                             gp_base = 'thai_col_flag_n'
-                        if gp_base in self.config.type_mapping.get("SUM_MIN_MAX", []): cat_cols['SUM_MIN_MAX'].append(col)
-                        elif gp_base in self.config.type_mapping.get("MIN_MAX", []): cat_cols['MIN_MAX'].append(col)
-                        elif gp_base in self.config.type_mapping.get("MD5_MIN_MAX", []): cat_cols['MD5_MIN_MAX'].append(col)
+
+                        if gp_base in self.config.type_mapping.get("SUM_MIN_MAX", []):
+                            cat_cols['SUM_MIN_MAX'].append(col)
+                            self.reconcile_method.append('number_sum_min_max')
+                        elif gp_base in self.config.type_mapping.get("MIN_MAX", []):
+                            cat_cols['MIN_MAX'].append(col)
+                            self.reconcile_method.append('dttm_min_max')
+                        elif gp_base in self.config.type_mapping.get("MD5_MIN_MAX", []):
+                            cat_cols['MD5_MIN_MAX'].append(col)
+                            self.reconcile_method.append('md5_min_max')
 
                 # Step 4: Build & Execute SparkSQL Expressions
                 self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
@@ -989,12 +1180,12 @@ class Worker(threading.Thread):
                         f.write(str(expr) + "\n")
 
                 out_file_name = "parquet_{0}_{1}_{2}_{3}.json".format(db, schema, partition, self.global_ts)
-                local_json_file = os.path.join(self.out_path, out_file_name)
+                self.local_json_file = os.path.join(self.out_path, out_file_name)
                 
-                with open(local_json_file, 'w') as f:
+                with open(self.local_json_file, 'w') as f:
                     json.dump(final_json, f)
 
-                copy_success, copy_err = self._copy_file_to_nas(local_json_file, db, schema, out_file_name)
+                copy_success, copy_err = self._copy_file_to_nas(self.local_json_file, db, schema, out_file_name)
                 
                 if copy_success:
                     self.logger.info("Worker {0} successfully saved local files and copied JSON to NAS for {1}".format(self.name, partition))
@@ -1011,28 +1202,34 @@ class Worker(threading.Thread):
                     remark = "{0} | {1}".format(remark, ",".join(manual_num_err))
                 
                 self.tracker.add_result(partition, status, duration, remark)
-                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), duration, status.lower(), remark)
+                #self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), duration, status.lower(), remark)
 
             except ValueError as ve:
-                msg = str(ve)
-                if "SKIPPED" in msg:
+                remark = str(ve)
+                if "SKIPPED" in remark:
                     status = "SKIPPED"
-                    msg = msg.replace("SKIPPED: ", "").replace("SKIPPED", "").strip()
+                    remark = remark.replace("SKIPPED: ", "").replace("SKIPPED", "").strip()
                 else:
                     status = "FAILED"
-                self.tracker.add_result(partition, status, time.time() - start_t, msg)
-                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, status.lower(), msg)
+                self.tracker.add_result(partition, status, time.time() - start_t, remark)
+                #self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, status.lower(), msg)
             except Exception as e:
-                err_msg = str(e)
+                remark = str(e)
                 # self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, repr(e)))
                 self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
-                self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(err_msg[:50]))
-                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, "failed", err_msg[:200])
-                if "CRITICAL_FAILED:" in err_msg:
+                self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(remark[:50]))
+                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, "failed", remark[:200])
+                if "CRITICAL_FAILED:" in remark:
                     self.logger.critical("Worker {0} signaling global abort due to CRITICAL_FAILED condition.".format(self.name))
                     self.abort_event.set()
                     break
             finally:
+                # After finishing processing, write one CSV line:
+                try:
+                    self.logger.info("Worker {0} logging status for {1}...".format(self.name, full_name))
+                    self.logging_status(status, remark)
+                except Exception as e:
+                    self.logger.error("Failed writing logging_status for {}: {}".format(full_name, e))
                 self.queue.task_done()
 
 class MonitorThread(threading.Thread):
@@ -1119,6 +1316,9 @@ class ParquetQueryJob(object):
         self.meta_fetcher = MetadataFetcher(self.config.metadata_base_dir, logger)
         self.query_builder = SparkQueryBuilder(self.config.env_params, self.config.type_mapping, logger)
         self.hive_logger = HiveLogger(self.spark, logger)
+        self.file_h = FileHandler(logger)
+        self.status_file_locks = {}
+        self.status_file_locks_lock = threading.Lock()
 
         self.job_queue = Queue.Queue()
         self.abort_event = threading.Event()
@@ -1129,11 +1329,14 @@ class ParquetQueryJob(object):
             self.tracker.add_result(invalid_node['table'], "FAILED", 0.0, invalid_node['reason'])
 
     def run(self):
+        input_name = os.path.splitext(os.path.basename(self.args.list))[0]
+        status_file_filenm = "log_stat_rc_{0}_{1}.csv".format(input_name, self.global_ts)
+
         num_workers = int(self.args.concurrency)
         workers = []
         for i in range(num_workers):
             w = Worker(i+1, self.job_queue, self.config, self.log_parser, self.hdfs_h, self.meta_fetcher, 
-                       self.query_builder, self.hive_logger, self.spark, self.tracker, self.logger, self.execution_id, self.global_ts, self.out_path, self.abort_event, self.run_id)
+                       self.query_builder, self.hive_logger, self.spark, self.tracker, self.logger, self.execution_id, self.global_ts, self.out_path, self.abort_event, self.run_id, status_file_filenm, self.status_file_locks, self.status_file_locks_lock, self.file_h)
             workers.append(w)
             w.start()
 
@@ -1157,6 +1360,23 @@ class ParquetQueryJob(object):
         finally:
             monitor.stop()
             monitor.join()
+
+            # Copy stat file to NAS
+            temp_stat_dir = os.path.join(self.config.local_temp_dir, 'stat_csv')
+            files = glob.glob(os.path.join(temp_stat_dir, '*', '*', status_file_filenm))
+            if files:
+                self.logger.info("")
+                self.logger.info("Start Copy Stat file = {0} file(s) to NAS...".format(len(files)))
+                for f in files:
+                    rel = os.path.relpath(os.path.dirname(f), temp_stat_dir)
+
+                    #/xx/xx/xx/mig_reconcile_query_gp_output/YYYYMMDD/{db}/{schema}}/stat_csv
+                    dest_path = os.path.join(self.config.nas_destination, rel, 'stat_csv')
+                    self.file_h.copy_to_nas(f, dest_path)
+
+                self.logger.info("Copy Stat file = {0} file(s) to NAS successfully".format(len(files)))
+                self.logger.info("")
+
             self.spark.stop()
             self.tracker.print_summary(self.log_path, self.config.nas_destination)
 
