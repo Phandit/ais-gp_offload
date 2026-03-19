@@ -173,7 +173,7 @@ class ConfigManager(object):
         self.thai_mapping_table = ''
         self.thai_mapping_export_path = ''
         self.thai_dict = {}
-
+        
         self.local_temp_dir = os.path.join(main_path, 'output')
         #self.nas_dest_base = os.path.join(main_path, 'output')
         #self.log_dir = os.path.join(main_path, 'log')
@@ -239,18 +239,25 @@ class ConfigManager(object):
         # 2. Load Target Tables (Moved up before Thai mapping logic to build IN clause)
         self.execution_list = []
         self.invalid_tables = []
+        seen_tables = set()
+
         if cli_tables:
             self.logger.info("Using CLI arguments for table list.")
-            tables = cli_tables.split(',')
+            tables = cli_tables.lower().split(',')
             for t in tables:
                 try:
                     db_part, tbl_part = t.split('|')
                     sch_part, real_tbl = tbl_part.split('.')
                     if db_part and sch_part and real_tbl:
+                        table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                        if table_key in seen_tables:
+                            self.logger.warning("Duplicate table found and removed: {0}".format(t.strip()))
+                            continue
+                        seen_tables.add(table_key)
                         self.execution_list.append({
-                            'db': db_part.strip(),
-                            'schema': sch_part.strip(),
-                            'partition': real_tbl.strip()
+                            'db': table_key[0],
+                            'schema': table_key[1],
+                            'partition': table_key[2]
                         })
                     else:
                         self.logger.error("Invalid format in argument: {0}. Expected DB|Schema.Table".format(t))
@@ -264,16 +271,21 @@ class ConfigManager(object):
             try:
                 with open(list_file_path, 'r') as f:
                     for line in f:
-                        line = line.strip()
+                        line = line.strip().lower()
                         if not line or line.startswith('#'): continue
                         try:
                             db_part, tbl_part = line.split('|')
                             sch_part, real_tbl = tbl_part.split('.')
                             if db_part and sch_part and real_tbl:
+                                table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                                if table_key in seen_tables:
+                                    self.logger.warning("Duplicate table found and removed in list file: {0}".format(line))
+                                    continue
+                                seen_tables.add(table_key)
                                 self.execution_list.append({
-                                    'db': db_part.strip(),
-                                    'schema': sch_part.strip(),
-                                    'partition': real_tbl.strip()
+                                    'db': table_key[0],
+                                    'schema': table_key[1],
+                                    'partition': table_key[2]
                                 })
                             else:
                                 self.logger.error("Skipping invalid line in list file: {0}. Expected DB|Schema.Table".format(line))
@@ -905,7 +917,7 @@ class Worker(threading.Thread):
         except Exception as e:
             return False, str(e)
 
-    def logging_status(self, status, remark=""):
+    def logging_status(self, status, remark="", nas_json_path=""):
         # 1. Define directory path
         # temp status directory: /output/<date>/stat_csv/<db>/<schema>
         status_dir = os.path.join(self.config.local_temp_dir, 'stat_csv', self.db, self.schema)
@@ -914,7 +926,6 @@ class Worker(threading.Thread):
 
         remark = "-" if status.upper() == "SUCCESS" else remark
         statused = "SUCCEEDED" if status.upper() == "SUCCESS" else status
-
 
         # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
@@ -944,7 +955,7 @@ class Worker(threading.Thread):
         start_ts = getattr(self, "start_ts_tbl", "")
         #status = getattr(self, "status", "")
         #error_message = getattr(self, "error_message", "").replace('\n', ' ')
-        json_output_path = getattr(self, "local_json_file", "")
+        #json_output_path = getattr(self, "local_json_file", "")
         reconcile_method = getattr(self, "reconcile_method", [])
         self.logger.info("[{0}] Retrieved attributes for logging. Short Name: {1}, Start TS: {2}, Status: {3}".format(
             self.name, short_name, start_ts, statused
@@ -977,7 +988,7 @@ class Worker(threading.Thread):
             reconcile_method_str, 
             statused, 
             remark, 
-            json_output_path, 
+            nas_json_path, 
             "" # remark
             ] 
 
@@ -1187,17 +1198,44 @@ class Worker(threading.Thread):
                 with open(self.local_json_file, 'w') as f:
                     json.dump(final_json, f)
 
+                # Copy both files to NAS
                 copy_success, copy_err = self._copy_file_to_nas(self.local_json_file, db, schema, out_file_name)
+                # copy_sql_success, copy_sql_err = self._copy_file_to_nas(local_query_file, db, schema, query_file_name)
                 
-                if copy_success:
-                    self.logger.info("Worker {0} successfully saved local files and copied JSON to NAS for {1}".format(self.name, partition))
+                # Check actual existence on NAS
+                nas_dir = os.path.join(self.config.nas_destination, db, schema)
+                nas_json_path = os.path.join(nas_dir, out_file_name)
+                # nas_sql_path = os.path.join(nas_dir, query_file_name)
+                
+                json_exists = os.path.exists(nas_json_path)
+                # sql_exists = os.path.exists(nas_sql_path)
+
+                # if copy_success and copy_sql_success and json_exists and sql_exists:
+                #     self.logger.info("Worker {0} successfully saved and copied both JSON and SQL to NAS for {1}".format(self.name, partition))
+                # else:
+                #     self.logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2} | SQL Err: {3}".format(
+                #         self.name, partition, copy_err, copy_sql_err))
+                if copy_success and json_exists:
+                    self.logger.info("Worker {0} successfully saved and copied JSON to NAS for {1}".format(self.name, partition))
+                    status = "SUCCESS"
+                    remark = "JSON Generated."
                 else:
-                    raise RuntimeError("Failed to copy file to NAS: {0}".format(copy_err))
+                    self.logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2}".format(
+                        self.name, partition, copy_err))
+                    
+                    status = "FAILED"
+                    err_remarks = []
+                    if not copy_success: err_remarks.append("JSON Copy Error ({0})".format(copy_err))
+                    if not json_exists: err_remarks.append("JSON Not Found on NAS")
+                    # if not copy_sql_success: err_remarks.append("SQL Copy Error ({0})".format(copy_sql_err))
+                    # if not sql_exists: err_remarks.append("SQL Not Found on NAS")
+                    remark = " | ".join(err_remarks)
 
                 # Step 6: Finalize Status
                 duration = time.time() - start_t
-                status = "FAILED" if missing_meta else "SUCCESS"
-                remark = "Metadata Missing (Count-only)" if missing_meta else "JSON Generated"
+
+                if missing_meta:
+                    remark = "Metadata Missing (Count-only) | " + remark
 
                 if manual_num_err:
                     status = "FAILED"
@@ -1229,7 +1267,7 @@ class Worker(threading.Thread):
                 # After finishing processing, write one CSV line:
                 try:
                     self.logger.info("Worker {0} logging status for {1}...".format(self.name, full_name))
-                    self.logging_status(status, remark)
+                    self.logging_status(status, remark, nas_json_path)
                 except Exception as e:
                     self.logger.error("Failed writing logging_status for {}: {}".format(full_name, e))
                 self.queue.task_done()
@@ -1380,7 +1418,6 @@ class ParquetQueryJob(object):
 
                     #/xx/xx/xx/mig_reconcile_query_gp_output/YYYYMMDD/{db}/{schema}}/stat_csv
                     dest_path = os.path.join(self.config.nas_destination, rel, 'stat_csv')
-                    #self.logger.info("Copying {0} to NAS path: {1}".format(f, dest_path))
                     self.file_h.copy_to_nas(f, dest_path)
 
                 self.logger.info("Copy Stat file = {0} file(s) to NAS successfully".format(len(files)))
@@ -1452,4 +1489,10 @@ if __name__ == "__main__":
         job.run()
     except Exception as e:
         logger.critical("Job aborted due to critical error: {0}".format(e), exc_info=True)
+        print("\n" + "!" * 80)
+        print("CRITICAL FAILURE")
+        print("The script was aborted due to a critical error.")
+        print("Please check the log file for detailed information:")
+        print("Log File Location: {0}".format(os.path.abspath(log_path)))
+        print("!" * 80 + "\n")
         sys.exit(1)
