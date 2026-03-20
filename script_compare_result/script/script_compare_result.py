@@ -477,7 +477,7 @@ class ReconcileMain(object):
                     'method': method, 
                     'gp_vals': gp_vals, 
                     'pq_vals': pq_vals, 
-                    'status': 'MATCHED', 
+                    'status': 'PASSED', 
                     'data_type': dtype,
                     'remark': None
                 }
@@ -506,7 +506,7 @@ class ReconcileMain(object):
                     col_errors.append("Content mismatched in: {0}".format(", ".join(content_diffs)))
                 
                 if col_errors:
-                    col_res['status'] = 'MISMATCHED'
+                    col_res['status'] = 'FAILED'
                     col_res['remark'] = " | ".join(col_errors)
                 
                 res['columns'].append(col_res)
