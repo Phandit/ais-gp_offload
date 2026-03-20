@@ -20,3 +20,6 @@ cast_double_s=15
 round_numeric=10
 round_real=5
 round_double=14
+
+KEYTAB_PATH=/home/dlcdrauth/dlcdrauth.keytab
+PRINCIPAL=dlcdrauth@CORP.AIS900.ORG
