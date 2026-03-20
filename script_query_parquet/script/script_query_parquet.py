@@ -1526,6 +1526,7 @@ if __name__ == "__main__":
         print("\n" + "!" * 80)
         print("CRITICAL FAILURE")
         print("The script was aborted due to a critical error.")
+        print("{0} \n".format(e))
         print("Please check the log file for detailed information:")
         print("Log File Location: {0}".format(os.path.abspath(log_path)))
         print("!" * 80 + "\n")
