@@ -61,6 +61,11 @@ class ProcessTracker(object):
             elif r['status'] == 'SKIPPED': skipped_count += 1
             else: failed_count += 1
 
+        elapsed_seconds = int(time.time() - self.start_time)
+        h, rem = divmod(elapsed_seconds, 3600)
+        m, s = divmod(rem, 60)
+        duration_str = "{0:02d}:{1:02d}:{2:02d}".format(h, m, s)
+
         summary_lines = [
             "",
             "="*80,
@@ -72,6 +77,7 @@ class ProcessTracker(object):
             "LOADED       : {0}".format(loaded_count),
             "SKIPPED      : {0}".format(skipped_count),
             "FAILED       : {0}".format(failed_count),
+            "Duration     : {0}".format(duration_str),
             "Log File     : {0}".format(log_path),
             "Output Dir   : {0}".format(output_dir),
             "="*80
@@ -108,7 +114,7 @@ class MonitorThread(threading.Thread):
         lines = []
         lines.append("============================================================")
         lines.append(" RECONCILE COMPARE MONITOR (Python 2.7) ")
-        lines.append(" Execution ID: {0}".format(self.tracker.execution_id)) # แสดง ID ใน Dashboard
+        lines.append(" Execution ID: {0}".format(self.tracker.execution_id))
         lines.append("============================================================")
         lines.append(" Progress: {0}/{1} ({2:.2f}%)".format(comp, total, pct))
         lines.append(" Elapsed : {0:.0f}s".format(elapsed))
@@ -132,26 +138,31 @@ class MonitorThread(threading.Thread):
         sys.stdout.flush()
 
 def setup_logging(log_dir, log_name="app", timestamp=None):
-    if not os.path.exists(log_dir): os.makedirs(log_dir)
-    log_file = os.path.join(log_dir, "{0}_{1}.log".format(log_name, timestamp))
-    logger = logging.getLogger("CompareJob")
-    logger.setLevel(logging.INFO)
-    logger.handlers = []
-    fh = logging.FileHandler(log_file)
-    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-    logger.addHandler(fh)
-    return logger, log_file
+    try:
+        if not os.path.exists(log_dir): os.makedirs(log_dir)
+        log_file = os.path.join(log_dir, "{0}_{1}.log".format(log_name, timestamp))
+        logger = logging.getLogger("CompareJob")
+        logger.setLevel(logging.INFO)
+        logger.handlers = []
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        logger.addHandler(fh)
+        return logger, log_file
+    except Exception as e:
+        print("CRITICAL ERROR: Cannot create log directory or file. Permission denied or disk full? Error: {0}".format(e))
+        sys.exit(1)
 
 # ==============================================================================
 # 2. Configuration & Initialization
 # ==============================================================================
 
 class ConfigManager(object):
-    def __init__(self, args, logger, execution_id):
+    def __init__(self, args, logger, execution_id, log_path):
         self.logger = logger
         self.mode = args.mode
         self.args = args
         self.execution_id = execution_id
+        self.log_path = log_path
         
         self.succeed_log_gp_path = ''
         self.succeed_log_pq_path = ''
@@ -185,6 +196,13 @@ class ConfigManager(object):
                         elif key == 'hive_result_table': self.hive_result_table = val
         except Exception as e:
             self.logger.critical("Cannot read env config: {0}".format(e))
+            err_msg = "Cannot read env config file: {0} | Error: {1}".format(env_path, e)
+            self.logger.critical(err_msg)
+            print("\n============================================================")
+            print(" [CRITICAL ERROR] Failed to load Environment Configuration")
+            print(" File Path : {0}".format(env_path))
+            print(" Details   : {0}".format(e))
+            print("============================================================\n")
             raise
 
     def _build_queue(self, list_path, cli_tables):
@@ -195,30 +213,77 @@ class ConfigManager(object):
             task_key = "{0}.{1}.{2}".format(db_part, sch_part, real_tbl)
             if task_key not in seen_tables:
                 seen_tables.add(task_key)
-                exec_list.append({'db': db_part.strip(), 'schema': sch_part.strip(), 'partition': real_tbl.strip()})
+                exec_list.append({'db': db_part, 'schema': sch_part, 'partition': real_tbl})
 
         if cli_tables:
             for t in cli_tables.split(','):
-                db_part, tbl_part = t.split('|')
-                sch_part, real_tbl = tbl_part.split('.')
-                add_task(db_part.strip(), sch_part.strip(), real_tbl.strip())
+                try:
+                    db_part, tbl_part = t.split('|')
+                    sch_part, real_tbl = tbl_part.split('.')
+                    
+                    db_clean = db_part.strip()
+                    sch_clean = sch_part.strip()
+                    tbl_clean = real_tbl.strip()
+                    
+                    if not db_clean or not sch_clean or not tbl_clean:
+                        raise ValueError("Missing component")
+                        
+                    add_task(db_clean, sch_clean, tbl_clean)
+                except ValueError:
+                    err_msg = "Invalid table_name format: '{0}'. Expected 'db|schema.table_name' with all parts filled.".format(t)
+                    print("\n============================================================")
+                    print(" [CRITICAL ERROR] " + err_msg)
+                    print(" Log file: {0}".format(self.log_path))
+                    print("============================================================\n")
+                    raise Exception(err_msg)
         elif list_path:
             try:
                 self.logger.info("Reading table list from: {0}".format(list_path))
                 with open(list_path, 'r') as f:
-                    for line in f:
+                    for line_num, line in enumerate(f, 1):
                         line = line.lower().strip()
                         if not line or line.startswith('#'): continue
-                        db_part, tbl_part = line.split('|')
-                        sch_part, real_tbl = tbl_part.split('.')
-                        add_task(db_part.strip(), sch_part.strip(), real_tbl.strip())
+                        try:
+                            db_part, tbl_part = line.split('|')
+                            sch_part, real_tbl = tbl_part.split('.')
+                            
+                            db_clean = db_part.strip()
+                            sch_clean = sch_part.strip()
+                            tbl_clean = real_tbl.strip()
+                            
+                            if not db_clean or not sch_clean or not tbl_clean:
+                                raise ValueError("Missing component")
+                                
+                            add_task(db_clean, sch_clean, tbl_clean)
+                        except ValueError:
+                            err_msg = "Invalid format at line {0} in {1}: '{2}'. Expected 'db|schema.table_name' with all parts filled.".format(line_num, list_path, line)
+                            print("\n============================================================")
+                            print(" [CRITICAL ERROR] " + err_msg)
+                            print(" Log file: {0}".format(self.log_path))
+                            print("============================================================\n")
+                            raise Exception(err_msg)
             except Exception as e:
-                self.logger.critical("Cannot read list table: {0}".format(e), exc_info=True)
+                err_msg = "Cannot read or parse list table file: {0} | Error: {1}".format(list_path, e)
+                self.logger.critical(err_msg, exc_info=True)                
+                print("\n" + "="*60)
+                print(" [CRITICAL ERROR] Failed to open Table List file")
+                print(" File Path : {0}".format(list_path))
+                print(" Details   : {0}".format(e))
+                print("="*60 + "\n")
                 raise
                 
         self.logger.info("Successfully loaded {0} unique tables into queue.".format(len(exec_list)))
+        
         if len(exec_list) == 0:
-            self.logger.warning("WARNING: Execution list is EMPTY. Workers will exit immediately.")
+            err_msg = "Execution list is EMPTY. No tables to process. Aborting."
+            self.logger.critical(err_msg)
+            print("\n============================================================")
+            print(" [CRITICAL ERROR] " + err_msg)
+            print(" Please check your input file: {0}".format(list_path or cli_tables))
+            print(" Log file: {0}".format(self.log_path))
+            print("============================================================\n")
+            raise Exception(err_msg)
+            
         return exec_list
     
     def _log_configurations(self):
@@ -232,6 +297,7 @@ class ConfigManager(object):
         self.logger.info("Hive Status Table    : {0}".format(self.hive_status_table))
         self.logger.info("Hive Result Table    : {0}".format(self.hive_result_table))
         self.logger.info("Execution ID         : {0}".format(self.execution_id))
+        self.logger.info("Log File Path        : {0}".format(self.log_path))
         self.logger.info("------------------------------")
 
 # ==============================================================================
@@ -274,6 +340,7 @@ class SucceededLogValidator(object):
                                 if not current_ts or new_ts > current_ts:
                                     row['run_status'] = row.get('run_status', '').strip()
                                     row['json_output_path'] = row.get('json_output_path', '').strip()
+                                    row['source_file_path'] = log_file
                                     self.cache[source][cache_key][tbl] = row
                 except Exception as e:
                     self.logger.warning("Error reading log file {0}: {1}".format(log_file, e))
@@ -302,8 +369,8 @@ class SucceededLogValidator(object):
         if mode in ['compare', 'load_gp', 'load_both']:
             row = find_row_in_cache('gp')
             if row:
-                self.logger.info("LogValidator [GP]: Latest record for '{0}' has status '{1}' at '{2}'".format(
-                    partition, row.get('run_status'), row.get('end_timestamp')))
+                self.logger.info("LogValidator [GP]: Latest record for '{0}' has status '{1}' at '{2}' [Source: {3}]".format(
+                    partition, row.get('run_status'), row.get('end_timestamp'), row.get('source_file_path')))
                 if row.get('run_status') == 'SUCCEEDED':
                     gp_path = row.get('json_output_path', '').strip()
                 else:
@@ -314,8 +381,8 @@ class SucceededLogValidator(object):
         if mode in ['compare', 'load_pq', 'load_both']:
             row = find_row_in_cache('pq')
             if row:
-                self.logger.info("LogValidator [PQ]: Latest record for '{0}' has status '{1}' at '{2}'".format(
-                    partition, row.get('run_status'), row.get('end_timestamp')))
+                self.logger.info("LogValidator [PQ]: Latest record for '{0}' has status '{1}' at '{2}' [Source: {3}]".format(
+                    partition, row.get('run_status'), row.get('end_timestamp'), row.get('source_file_path')))
                 if row.get('run_status') == 'SUCCEEDED':
                     pq_path = row.get('json_output_path', '').strip()
                 else:
@@ -370,7 +437,6 @@ class ReconcileMain(object):
             'remark': 'Successfully Matched'
         }
 
-        # Count Structures
         for m in ['SUM_MIN_MAX', 'MIN_MAX', 'MD5_MIN_MAX']:
             res['gp_struct'][m] = len(gp_data.get('methods', {}).get(m, {}))
             res['pq_struct'][m] = len(pq_data.get('methods', {}).get(m, {}))
@@ -389,7 +455,9 @@ class ReconcileMain(object):
 
         # Gate 3: Content Match
         all_methods = set(gp_data.get('methods', {}).keys() + pq_data.get('methods', {}).keys())
-        content_failed = False
+        
+        has_datatype_mismatch = False
+        has_content_mismatch = False
 
         for method in all_methods:
             gp_cols = gp_data.get('methods', {}).get(method, {})
@@ -399,19 +467,59 @@ class ReconcileMain(object):
             for col in all_cols:
                 gp_vals = gp_cols.get(col, {})
                 pq_vals = pq_cols.get(col, {})
-                dtype = gp_vals.get('data_type') or pq_vals.get('data_type') or 'UNKNOWN'
-                col_res = {'col_nm': col, 'method': method, 'gp_vals': gp_vals, 'pq_vals': pq_vals, 'status': 'MATCHED', 'data_type': dtype}
                 
-                # Exact match check
-                if gp_vals != pq_vals:
-                    col_res['status'] = 'MISMATCHED'
-                    content_failed = True
+                gp_dtype = gp_vals.get('data_type')
+                pq_dtype = pq_vals.get('data_type')
+                dtype = gp_dtype or pq_dtype or 'UNKNOWN'
+                
+                col_res = {
+                    'col_nm': col, 
+                    'method': method, 
+                    'gp_vals': gp_vals, 
+                    'pq_vals': pq_vals, 
+                    'status': 'PASSED', 
+                    'data_type': dtype,
+                    'remark': None
+                }
+                
+                col_errors = []
+                
+                if gp_dtype != pq_dtype:
+                    has_datatype_mismatch = True
+                    col_errors.append("Data type mismatched: GP={0}, PQ={1}".format(gp_dtype, pq_dtype))
+                
+                content_diffs = []
+                keys_to_check = []
+                if method == 'SUM_MIN_MAX':
+                    keys_to_check = ['sum', 'min', 'max']
+                elif method == 'MIN_MAX':
+                    keys_to_check = ['min', 'max']
+                elif method == 'MD5_MIN_MAX':
+                    keys_to_check = ['min_md5', 'max_md5']
+                    
+                for k in keys_to_check:
+                    if gp_vals.get(k) != pq_vals.get(k):
+                        content_diffs.append(k)
+                        
+                if content_diffs:
+                    has_content_mismatch = True
+                    col_errors.append("Content mismatched in: {0}".format(", ".join(content_diffs)))
+                
+                if col_errors:
+                    col_res['status'] = 'FAILED'
+                    col_res['remark'] = " | ".join(col_errors)
                 
                 res['columns'].append(col_res)
 
-        if content_failed and res['status'] == 'PASSED':
+        if has_datatype_mismatch and has_content_mismatch:
             res['status'] = 'FAILED'
-            res['remark'] = 'Some columns data mismatched'
+            res['remark'] = 'Some columns data type and content mismatched'
+        elif has_datatype_mismatch:
+            res['status'] = 'FAILED'
+            res['remark'] = 'Some columns data type mismatched'
+        elif has_content_mismatch:
+            res['status'] = 'FAILED'
+            res['remark'] = 'Some columns content mismatched'
 
         return res
     
@@ -516,7 +624,7 @@ class ResultDataHandler(object):
             'gp_sum': None, 'gp_min': None, 'gp_max': None,
             'pq_sum': None, 'pq_min': None, 'pq_max': None,
             'reconcile_result': status, 'execution_id': execution_id, 
-            'remark': None
+            'remark': col_res.get('remark')
         }
 
         if method == 'SUM_MIN_MAX':
@@ -550,18 +658,26 @@ class ReportWriter(object):
         self.d_cols = ['table_name', 'col_nm', 'data_type', 'method', 'gp_sum', 'gp_min', 'gp_max', 'pq_sum', 'pq_min', 'pq_max',
                        'reconcile_result', 'execution_id', 'remark']
                        
-        with open(self.header_csv, 'w') as f:
-            csv.DictWriter(f, fieldnames=self.h_cols).writeheader()
-        with open(self.detail_csv, 'w') as f:
-            csv.DictWriter(f, fieldnames=self.d_cols).writeheader()
+        try:
+            with open(self.header_csv, 'w') as f:
+                csv.DictWriter(f, fieldnames=self.h_cols).writeheader()
+            with open(self.detail_csv, 'w') as f:
+                csv.DictWriter(f, fieldnames=self.d_cols).writeheader()
+        except Exception as e:
+            self.logger.critical("Failed to initialize Output CSV files. Path: {0}. Error: {1}".format(out_dir, e))
+            raise Exception("ReportWriter Initialization Failed: {0}".format(e))
 
     def append_results(self, h_rec, d_recs):
         with self.lock:
-            with open(self.header_csv, 'a') as f:
-                csv.DictWriter(f, fieldnames=self.h_cols).writerow(h_rec)
-            with open(self.detail_csv, 'a') as f:
-                writer = csv.DictWriter(f, fieldnames=self.d_cols)
-                for rec in d_recs: writer.writerow(rec)
+            try:
+                with open(self.header_csv, 'a') as f:
+                    csv.DictWriter(f, fieldnames=self.h_cols).writerow(h_rec)
+                with open(self.detail_csv, 'a') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.d_cols)
+                    for rec in d_recs: writer.writerow(rec)
+            except Exception as e:
+                self.logger.critical("ReportWriter Failed to write CSVs! Error: {0}".format(e), exc_info=True)
+                raise
     
 class VenvParquetHandler(object):
     def __init__(self, activate_cmd, writer_script_path, local_status, local_result, hdfs_status, hdfs_result, logger):
@@ -574,10 +690,14 @@ class VenvParquetHandler(object):
         self.logger = logger
         self.lock = threading.Lock()
 
-        if self.local_status and not os.path.exists(self.local_status):
-            os.makedirs(self.local_status)
-        if self.local_result and not os.path.exists(self.local_result):
-            os.makedirs(self.local_result)
+        try:
+            if self.local_status and not os.path.exists(self.local_status):
+                os.makedirs(self.local_status)
+            if self.local_result and not os.path.exists(self.local_result):
+                os.makedirs(self.local_result)
+        except Exception as e:
+            logger.critical("Cannot create local temp parquet directories. Error: {0}".format(e))
+            raise Exception("VenvParquetHandler Initialization Failed")
 
     def log_results(self, h_rec, d_recs, worker=None):
         if not self.local_status or not self.local_result: 
@@ -805,12 +925,16 @@ class ReconcileJob(object):
         self.global_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.job_start_time = datetime.now()
         self.out_dir = os.path.join(main_path, 'output', datetime.now().strftime("%Y%m%d"))
-        if not os.path.exists(self.out_dir): os.makedirs(self.out_dir)
+        try:
+            if not os.path.exists(self.out_dir): os.makedirs(self.out_dir)
+        except Exception as e:
+            logger.critical("Cannot create output directory: {0}. Error: {1}".format(self.out_dir, e))
+            raise Exception("Output Directory Creation Failed")
 
         short_uuid = str(uuid.uuid4()).split('-')[0]
         self.execution_id = "JOB_{0}_{1}".format(self.global_ts, short_uuid)
 
-        self.config = ConfigManager(args, logger, self.execution_id)
+        self.config = ConfigManager(args, logger, self.execution_id, self.log_path)
         
         if hasattr(self.config, 'kinit_cmd') and self.config.kinit_cmd:
             self._authenticate_kerberos()
@@ -845,12 +969,22 @@ class ReconcileJob(object):
         for task in self.config.execution_list: self.job_queue.put(task)
     
     def _authenticate_kerberos(self):
-        try:
-            self.logger.info("Executing Kerberos authentication: {0}".format(self.config.kinit_cmd))
-            subprocess.check_call(self.config.kinit_cmd, shell=True)
-            self.logger.info("Kerberos authentication successful.")
-        except subprocess.CalledProcessError as e:
-            self.logger.error("Kerberos authentication FAILED. HDFS commands may fail: {0}".format(e))
+        max_retries = 2
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.logger.info("Executing Kerberos authentication (Attempt {0}/{1}): {2}".format(attempt, max_retries, self.config.kinit_cmd))
+                subprocess.check_output(self.config.kinit_cmd, shell=True, stderr=subprocess.STDOUT)
+                self.logger.info("Kerberos authentication successful.")
+                return
+            except subprocess.CalledProcessError as e:
+                error_msg = e.output.decode('utf-8', errors='ignore') if e.output else str(e)
+                if attempt < max_retries:
+                    self.logger.warning("Kerberos authentication failed on attempt {0}. Retrying... Error: {1}".format(attempt, error_msg))
+                    time.sleep(1)
+                else:
+                    self.logger.critical("Kerberos authentication FAILED after {0} attempts. HDFS commands will fail. \n>> ACTUAL ERROR: {1}".format(max_retries, error_msg))
+                    raise Exception("Kerberos Authentication Failed: {0}".format(error_msg))
+
 
     def run(self):
         num_workers = self.args.concurrency
@@ -912,4 +1046,9 @@ if __name__ == "__main__":
         job.run()
     except Exception as e:
         logger.critical("Job aborted: {0}".format(e), exc_info=True)
+        print("\n" + "="*60)
+        print(" [JOB ABORTED] A critical error occurred!")
+        print(" Details  : {0}".format(e))
+        print(" Log File : {0}".format(log_path))
+        print("="*60 + "\n")
         sys.exit(1)
