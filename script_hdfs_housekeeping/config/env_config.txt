@@ -1,0 +1,3 @@
+hdfs_prefix=/data/gpoffload/data_recon
+retention_hours=24
+kinit=kinit -kt /home/dlcdrauth/dlcdrauth.keytab dlcdrauth@CORP.AIS900.ORG
