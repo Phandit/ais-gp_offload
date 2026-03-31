@@ -742,8 +742,6 @@ class HDFSHandler(object):
                 if any(f.endswith('.parquet') for f in files):
                     has_parquet = True
                     break
-        else:
-            has_parquet = local_file_path.endswith('.parquet')
 
         if not has_parquet:
             raise ValueError("SKIPPED: No parquet files found in local path (or sub-folders): {0}".format(local_file_path))
