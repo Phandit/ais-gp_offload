@@ -733,7 +733,7 @@ class HDFSHandler(object):
 
         # Guard: local path must exist
         if not os.path.exists(local_file_path):
-            raise ValueError("SKIPPED: Local path not found or inaccessible: {0}".format(local_file_path))
+            raise ValueError("FAILED: Local path not found or inaccessible: {0}".format(local_file_path))
 
         # Guard: at least one .parquet file must be present
         has_parquet = False
@@ -744,7 +744,7 @@ class HDFSHandler(object):
                     break
 
         if not has_parquet:
-            raise ValueError("SKIPPED: No parquet files found in local path (or sub-folders): {0}".format(local_file_path))
+            raise ValueError("FAILED: No parquet files found in local path (or sub-folders): {0}".format(local_file_path))
 
         # --- Directory path ---
         # PXF exports produce random filenames on every run, so per-file name matching between
@@ -753,7 +753,7 @@ class HDFSHandler(object):
         try:
             local_dir_mtime = os.path.getmtime(local_file_path)
         except OSError as e:
-            raise ValueError("SKIPPED: Cannot read local directory mtime: {0}".format(e))
+            raise ValueError("FAILED: Cannot read local directory mtime: {0}".format(e))
 
         local_dir_obj = self.Path("file:///" + os.path.abspath(local_file_path).replace("\\", "/").lstrip("/"))
         hdfs_dir_obj = self.Path(hdfs_dest_path)
