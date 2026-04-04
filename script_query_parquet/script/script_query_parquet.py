@@ -738,16 +738,40 @@ class HDFSHandler(object):
         if not os.path.exists(local_file_path):
             raise ValueError("FAILED: Local path not found or inaccessible: {0}".format(local_file_path))
 
-        # Guard: at least one .parquet file must be present
+        # Guard: at least one .parquet file must be present; collect sizes for logging
         has_parquet = False
+        parquet_sizes = []
         if os.path.isdir(local_file_path):
             for root, dirs, files in os.walk(local_file_path):
-                if any(f.endswith('.parquet') for f in files):
-                    has_parquet = True
-                    break
+                for fname in files:
+                    if fname.endswith('.parquet'):
+                        has_parquet = True
+                        try:
+                            parquet_sizes.append(os.path.getsize(os.path.join(root, fname)))
+                        except OSError:
+                            pass
 
         if not has_parquet:
             raise ValueError("FAILED: No parquet files found in local path (or sub-folders): {0}".format(local_file_path))
+
+        if parquet_sizes:
+            _fc  = len(parquet_sizes)
+            _mn  = min(parquet_sizes)
+            _mx  = max(parquet_sizes)
+            _tot = sum(parquet_sizes)
+            self.logger.info(
+                "[HDFSHandler] Local parquet stats for {0}: "
+                "file_count={1}, "
+                "min_size={2}B ({3:.6f}GB), "
+                "max_size={4}B ({5:.6f}GB), "
+                "folder_size={6}B ({7:.2f}MB, {8:.6f}GB)".format(
+                    local_file_path,
+                    _fc,
+                    _mn, _mn / 1073741824.0,
+                    _mx, _mx / 1073741824.0,
+                    _tot, _tot / 1048576.0, _tot / 1073741824.0
+                )
+            )
 
         # --- Directory path ---
         # PXF exports produce random filenames on every run, so per-file name matching between
@@ -1151,6 +1175,39 @@ class Worker(threading.Thread):
                 )
             )
 
+    def _resolve_parquet_path(self, hdfs_dest):
+        """Inspect HDFS structure: flat .parquet -> return as-is; sub-dirs -> return path/*/*.parquet"""
+        try:
+            sc = self.spark.sparkContext
+            hadoop_conf = sc._jsc.hadoopConfiguration()
+            fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+            Path = sc._jvm.org.apache.hadoop.fs.Path
+            hdfs_path = Path(hdfs_dest)
+            if not fs.exists(hdfs_path):
+                return hdfs_dest
+            statuses = fs.listStatus(hdfs_path)
+            has_parquet_direct = False
+            has_subdirs = False
+            for status in statuses:
+                name = status.getPath().getName()
+                if status.isFile() and name.endswith('.parquet'):
+                    has_parquet_direct = True
+                elif status.isDirectory():
+                    has_subdirs = True
+            if has_parquet_direct:
+                self.logger.info("[{0}] Parquet files found directly in: {1}".format(self.name, hdfs_dest))
+                return hdfs_dest
+            elif has_subdirs:
+                resolved = hdfs_dest + "/*/*.parquet"
+                self.logger.info("[{0}] Parquet files in sub-folders, using pattern: {1}".format(self.name, resolved))
+                return resolved
+            else:
+                return hdfs_dest
+        except Exception as e:
+            self.logger.warning("[{0}] _resolve_parquet_path failed for {1}: {2}. Using original path.".format(
+                self.name, hdfs_dest, e))
+            return hdfs_dest  # safe fallback
+
     def run(self):
         while(True):
             if self.abort_event.is_set():
@@ -1254,7 +1311,8 @@ class Worker(threading.Thread):
 
                 # Step 4: Build & Execute SparkSQL Expressions
                 self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
-                df = self.spark.read.parquet(hdfs_dest)
+                parquet_read_path = self._resolve_parquet_path(hdfs_dest)
+                df = self.spark.read.parquet(parquet_read_path)
                 self._log_reconcile_column_usage(partition, cat_cols, df.dtypes)
                 # FOR DEBUG
                 # self.logger.info("Total rows in raw parquet (count action): {}".format(df.count()))
