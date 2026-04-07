@@ -21,7 +21,15 @@ round_numeric=10
 round_real=5
 round_double=14
 
-hdfs_replication=1
+hdfs_replication=2
+hdfs_put_parallelism=5
+
+spark_executor_cores=2
+spark_executor_memory=4g
+spark_executor_memory_overhead=2g
+spark_driver_cores=2
+spark_driver_memory=4g
+
 KEYTAB_PATH=/home/dlcdrauth/dlcdrauth.keytab
 PRINCIPAL=dlcdrauth@CORP.AIS900.ORG
 list_datatype_conv_only_no_len=chAr,Character
