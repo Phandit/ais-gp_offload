@@ -937,7 +937,7 @@ class HDFSHandler(object):
         try:
             dir_obj = self.Path(hdfs_dir_path)
             if not self.fs.exists(dir_obj):
-                self.logger.warning("[set_replication_recursive] Path not found, skipping: {0}".format(hdfs_dir_path))
+                self.logger.warning("[set_replication] Path not found, skipping: {0}".format(hdfs_dir_path))
                 return
 
             updated = [0]
@@ -947,7 +947,7 @@ class HDFSHandler(object):
                 try:
                     statuses = self.fs.listStatus(path_obj)
                 except Exception as list_err:
-                    self.logger.warning("[set_replication_recursive] listStatus failed for {0}: {1}".format(
+                    self.logger.warning("[set_replication] listStatus failed for {0}: {1}".format(
                         path_obj.toString(), list_err))
                     return
                 for st in statuses:
@@ -958,16 +958,16 @@ class HDFSHandler(object):
                             self.fs.setReplication(st.getPath(), factor)
                             updated[0] += 1
                         except Exception as rep_err:
-                            self.logger.warning("[set_replication_recursive] setReplication failed for {0}: {1}".format(
+                            self.logger.warning("[set_replication] setReplication failed for {0}: {1}".format(
                                 st.getPath().toString(), rep_err))
                             failed[0] += 1
 
             _walk(dir_obj)
             self.logger.info(
-                "[set_replication_recursive] {0}: replication={1}, updated={2}, failed={3}".format(
+                "[set_replication] {0}: replication={1}, updated={2}, failed={3}".format(
                     hdfs_dir_path, factor, updated[0], failed[0]))
         except Exception as e:
-            self.logger.warning("[set_replication_recursive] Unexpected error for {0}: {1}".format(
+            self.logger.warning("[set_replication] Unexpected error for {0}: {1}".format(
                 hdfs_dir_path, e))
 
 class MetadataFetcher(object):
@@ -1106,7 +1106,7 @@ class Worker(threading.Thread):
         except Exception as e:
             return False, str(e)
 
-    def logging_status(self, status, remark="", nas_json_path=""):
+    def logging_status(self, status, remark="", nas_json_path="", hdfs_path=""):
         # 1. Define directory path
         # temp status directory: /output/<date>/stat_csv/<db>/<schema>
         status_dir = os.path.join(self.config.local_temp_dir, 'stat_csv', self.db, self.schema)
@@ -1178,7 +1178,8 @@ class Worker(threading.Thread):
             statused, 
             remark, 
             nas_json_path, 
-            "" # remark
+            "",  # remark
+            hdfs_path
             ] 
 
         row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
@@ -1355,6 +1356,7 @@ class Worker(threading.Thread):
             status = "FAILED"
             remark = ""
             nas_json_path = ""
+            hdfs_dest = ""
 
             base_table = partition.split('_1_prt_')[0] if '_1_prt_' in partition else partition
 
@@ -1427,10 +1429,6 @@ class Worker(threading.Thread):
                 agg_result = df.agg(*agg_exprs).collect()
                 if not agg_result:
                     raise RuntimeError("Spark aggregation returned empty result for {0}".format(partition))
-
-                # Downgrade HDFS replication to 1 now that reconcile read has succeeded.
-                # Non-fatal: a warning is logged but the table status is unaffected.
-                self.hdfs_h.set_replication_recursive(hdfs_dest, 1)
 
                 sp_row = agg_result[0]
                 
@@ -1551,7 +1549,7 @@ class Worker(threading.Thread):
                 # After finishing processing, write one CSV line:
                 try:
                     self.logger.info("Worker {0} logging status for {1}...".format(self.name, full_name))
-                    self.logging_status(status, remark, nas_json_path)
+                    self.logging_status(status, remark, nas_json_path, hdfs_dest)
                 except Exception as e:
                     self.logger.error("Failed writing logging_status for {}: {}".format(full_name, e))
                 self.queue.task_done()
@@ -1597,7 +1595,7 @@ class UploadWorker(threading.Thread):
         self.status = ""
         self.error_message = ""
 
-    def logging_status(self, status, remark=""):
+    def logging_status(self, status, remark="", hdfs_path=""):
         status_dir = os.path.join(self.config.local_temp_dir, 'stat_csv', self.db, self.schema)
         self.logger.info("[{0}] Logging status to: {1}".format(self.name, status_dir))
 
@@ -1634,7 +1632,7 @@ class UploadWorker(threading.Thread):
 
         reconcile_method_str = ",".join(set(reconcile_method)) if reconcile_method else ""
 
-        row = [short_name, start_ts, end_ts, duration_str, reconcile_method_str, statused, remark, "", ""]
+        row = [short_name, start_ts, end_ts, duration_str, reconcile_method_str, statused, remark, "", "", hdfs_path]
         row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
 
         with lock:
@@ -1687,6 +1685,7 @@ class UploadWorker(threading.Thread):
 
             status = "FAILED"
             remark = ""
+            hdfs_dest = ""
 
             # Progress callback updates the dashboard with per-file upload counts
             worker_name = self.name
@@ -1765,7 +1764,7 @@ class UploadWorker(threading.Thread):
                     pass
 
                 try:
-                    self.logging_status(status, remark)
+                    self.logging_status(status, remark, hdfs_dest)
                 except Exception as e:
                     self.logger.error("Failed writing logging_status for {0}: {1}".format(full_name, e))
                 self.queue.task_done()
@@ -1975,7 +1974,7 @@ class ParquetQueryJob(object):
                 for f in files:
                     rel = os.path.relpath(os.path.dirname(f), temp_stat_dir)
 
-                    #/xx/xx/xx/mig_reconcile_query_gp_output/YYYYMMDD/{db}/{schema}}/stat_csv
+                    #/xx/xx/xx/mig_reconcile_query_parquet_output/YYYYMMDD/{db}/{schema}}/stat_csv
                     dest_path = os.path.join(self.config.nas_destination, rel, 'stat_csv')
                     self.file_h.copy_to_nas(f, dest_path)
 
@@ -2124,8 +2123,6 @@ if __name__ == "__main__":
     parser.add_argument('--env', default='env_config.txt')
     parser.add_argument('--master', help='Override config_master_file_path defined in env_config')
     parser.add_argument('--map', default='data_type_mapping.json')
-    #parser.add_argument('--list', default='list_table.txt')
-    #parser.add_argument('--table_name', help='Specific tables to run (DB|Schema.Partition)')
     parser.add_argument('--concurrency', default=4, type=int)
 
     # handle table and list as mutually exclusive arguments
