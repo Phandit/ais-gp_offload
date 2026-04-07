@@ -186,6 +186,7 @@ class ConfigManager(object):
         self.datatype_mapping_path = ''
         self.nas_destination = ''  # Default to prevent AttributeError if missing from env_config
         self.hdfs_replication = '1'
+        self.hdfs_put_parallelism = 20  # default; overridden by hdfs_put_parallelism in env_config
         self.mapping_file_path = ''
         self.master_file_path = ''
         self.gp_db = ''
@@ -223,6 +224,7 @@ class ConfigManager(object):
                         elif key == 'metadata_base_dir': self.metadata_base_dir = value
                         elif key == 'nas_destination': self.nas_destination = value
                         elif key == 'hdfs_replication': self.hdfs_replication = value
+                        elif key == 'hdfs_put_parallelism': self.hdfs_put_parallelism = int(value)
                         elif key == 'mapping_file_path': self.mapping_file_path = value
                         elif key == 'config_master_file_path': self.master_file_path = value
                         elif key == 'gp_db': self.gp_db = value
@@ -723,12 +725,12 @@ class LogParser(object):
             return None, "SKIPPED: Not found any Export Status"
     
 class HDFSHandler(object):
-    _PUT_PARALLEL = 20  # Per-table file upload parallelism
 
-    def __init__(self, spark_session, logger, replication="1"):
+    def __init__(self, spark_session, logger, replication="1", put_parallel=20):
         self.logger = logger
         self.spark = spark_session
         self.replication = replication
+        self._put_parallel = put_parallel  # per-table file upload parallelism, set from env_config
 
         # JVM filesystem init can fail if Kerberos ticket expired or Hadoop config missing
         try:
@@ -841,7 +843,7 @@ class HDFSHandler(object):
                         file_pairs.append((local_abs, hdfs_file))
 
                 num_files = len(file_pairs)
-                parallelism = min(self._PUT_PARALLEL, num_files) if num_files > 0 else 1
+                parallelism = min(self._put_parallel, num_files) if num_files > 0 else 1
                 log.info("[HDFSHandler] Uploading {0} files: {1} -> {2} (parallelism={3})".format(
                     num_files, local_file_path, hdfs_dest_path, parallelism))
 
@@ -2005,7 +2007,7 @@ class ParquetQueryJob(object):
 
         # Init Handlers
         self.log_parser = LogParser(self.config.succeed_path, logger)
-        self.hdfs_h = HDFSHandler(self.spark, logger, self.config.hdfs_replication)
+        self.hdfs_h = HDFSHandler(self.spark, logger, self.config.hdfs_replication, self.config.hdfs_put_parallelism)
         self.meta_fetcher = MetadataFetcher(self.config.metadata_base_dir, logger)
         self.query_builder = SparkQueryBuilder(self.config.env_params, self.config.type_mapping, logger)
         self.hive_logger = HiveLogger(self.spark, logger)
@@ -2133,8 +2135,8 @@ class HDFSSyncJob(object):
             raise RuntimeError("CRITICAL_FAILED: Cannot create SparkSession: {0}".format(e))
 
         self.log_parser = LogParser(self.config.succeed_path, logger)
-        # Use config.hdfs_replication for upload mode so replication factor matches env settings
-        self.hdfs_h = HDFSHandler(self.spark, logger, self.config.hdfs_replication)
+        # Use config values for upload mode so replication and parallelism match env settings
+        self.hdfs_h = HDFSHandler(self.spark, logger, self.config.hdfs_replication, self.config.hdfs_put_parallelism)
         self.file_h = FileHandler(logger)
         self.status_file_locks = {}
         self.status_file_locks_lock = threading.Lock()
