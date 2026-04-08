@@ -1113,8 +1113,12 @@ class Worker(threading.Thread):
         self.logger.info("[{0}] Logging status to directory: {1}".format(self.name, status_dir))
         #self.status = status
 
-        remark = "-" if status.upper() == "SUCCESS" else remark
         statused = "SUCCEEDED" if status.upper() == "SUCCESS" else status
+        # Route the incoming remark to the correct column based on final status:
+        # error_message (col 6) — filled when the table FAILED; otherwise "-"
+        # remark_col    (col 9) — filled when the table was SKIPPED; otherwise "-"
+        error_message = remark if statused == "FAILED" else "-"
+        remark_col    = remark if statused == "SKIPPED" else "-"
 
         # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
@@ -1176,9 +1180,10 @@ class Worker(threading.Thread):
             duration_str, 
             reconcile_method_str, 
             statused, 
-            remark, 
+            error_message, 
             nas_json_path, 
-            hdfs_path
+            hdfs_path,
+            remark_col
             ] 
 
         row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
@@ -1351,7 +1356,7 @@ class Worker(threading.Thread):
         # Sort by end_ts (col [2], '%Y-%m-%d %H:%M:%S') — ISO lexicographic order is deterministic
         all_rows.sort(key=lambda r: r[2].strip())
         latest = all_rows[-1]
-        return (latest[9].strip(), latest[5].strip())
+        return (latest[8].strip(), latest[5].strip())
 
     def _hdfs_has_parquet(self, hdfs_path):
         """Return True if at least one .parquet file exists anywhere under hdfs_path.
@@ -1662,46 +1667,86 @@ class UploadWorker(threading.Thread):
         self.status = ""
         self.error_message = ""
 
-    def logging_status(self, status, remark="", hdfs_path=""):
+    def logging_status(self, status, remark="-", nas_json_path="-", hdfs_path="-"):
+        # 1. Define directory path
+        # temp status directory: /output/<date>/stat_csv/<db>/<schema>
         status_dir = os.path.join(self.config.local_temp_dir, 'stat_csv', self.db, self.schema)
-        self.logger.info("[{0}] Logging status to: {1}".format(self.name, status_dir))
+        self.logger.info("[{0}] Logging status to directory: {1}".format(self.name, status_dir))
 
-        remark = "-" if status.upper() == "SUCCESS" else remark
         statused = "SUCCEEDED" if status.upper() == "SUCCESS" else status
+        # Route the incoming remark to the correct column based on final status:
+        # error_message (col 6) — filled when the table FAILED; otherwise "-"
+        # remark_col    (col 9) — filled when the table was SKIPPED; otherwise "-"
+        error_message = remark if statused == "FAILED" else "-"
+        remark_col    = remark if statused == "SKIPPED" else "-"
 
+        # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
             try:
                 os.makedirs(status_dir)
             except OSError as e:
+                # errno.EEXIST is Error code 17 (File exists)
+                # If the directory was created by another thread just now, ignore the error
                 if e.errno != errno.EEXIST:
-                    self.logger.critical("Cannot create directory {0}: {1}".format(status_dir, e))
+                    self.logger.critical("Cannot create directory {0}. Error: {1}".format(status_dir, e))
                     return
             except Exception as e:
                 self.logger.error("Unexpected error creating directory: {0}".format(e))
                 return
+        self.logger.info("[{0}] Directory created successfully: {1}".format(self.name, status_dir))
 
         status_file_full_path = os.path.join(status_dir, self.status_file_filenm)
 
+        # 3. Thread-safe lock acquisition (Optimized using setdefault)
+        # Acquire or create a per-file lock (shared across all workers) to prevent race conditions
         with self.status_file_locks_lock:
             lock = self.status_file_locks.setdefault(status_file_full_path, threading.Lock())
+        self.logger.info("[{0}] Acquired lock for file: {1}".format(self.name, status_file_full_path))
 
+        # 4. Attribute retrieval with getattr
         short_name = getattr(self, "short_name", "")
         start_ts = getattr(self, "start_ts_tbl", "")
         reconcile_method = getattr(self, "reconcile_method", [])
+        self.logger.info("[{0}] Retrieved attributes for logging. Short Name: {1}, Start TS: {2}, Status: {3}".format(
+            self.name, short_name, start_ts, statused
+        ))
 
+        # 5. Timing & Duration calculation
         curr_time = time.time()
         start_time = getattr(self, "start_time_tbl", None)
-        duration_sec = int(max(0, curr_time - start_time)) if start_time is not None else 0
+
+        if start_time is not None:
+            duration_sec = int(max(0, curr_time - start_time))
+        else:
+            duration_sec = 0
+
         hours, rem = divmod(duration_sec, 3600)
         minutes, seconds = divmod(rem, 60)
         duration_str = "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
         end_ts = datetime.fromtimestamp(curr_time).strftime("%Y-%m-%d %H:%M:%S")
+        self.logger.info("[{0}] Calculated duration: {1}".format(self.name, duration_str))
 
+        # 6. Reconcile method formatting
         reconcile_method_str = ",".join(set(reconcile_method)) if reconcile_method else ""
 
-        row = [short_name, start_ts, end_ts, duration_str, reconcile_method_str, statused, remark, "", "", hdfs_path]
+        # 7. Construct and encode row
+        row = [
+            short_name,
+            start_ts, end_ts,
+            duration_str,
+            reconcile_method_str,
+            statused,
+            error_message,
+            nas_json_path,
+            hdfs_path,
+            remark_col
+            ]
+
         row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
 
+        self.logger.info("Prepared log row for {0}: {1}".format(self.name, row))
+
+        # 8. Thread-safe file writing (Using binary mode 'ab' for Python 2.7)
         with lock:
             try:
                 with open(status_file_full_path, "ab") as f:
@@ -1831,7 +1876,7 @@ class UploadWorker(threading.Thread):
                     pass
 
                 try:
-                    self.logging_status(status, remark, hdfs_dest)
+                    self.logging_status(status, remark, "-", hdfs_dest)
                 except Exception as e:
                     self.logger.error("Failed writing logging_status for {0}: {1}".format(full_name, e))
                 self.queue.task_done()
