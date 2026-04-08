@@ -62,7 +62,12 @@ echo "With arguments: $@"
 echo "----------------------------------------------------------------------"
 
 # Use "$@" to forward all command-line arguments to the Python script
+# --conf ensures processTreeMetrics is set before SparkContext creation
 spark-submit \
-    --master local[*] \
+    --master yarn \
+    --deploy-mode client \
+    --num-executors 5 \
+    --executor-cores 10 \
+    --conf spark.executor.processTreeMetrics.enabled=true \
     --name "reconcile_parquet_job" \
     "${PYTHON_SCRIPT}" "$@"
