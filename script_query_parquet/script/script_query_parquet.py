@@ -686,6 +686,23 @@ class HDFSHandler(object):
             self.logger.critical("CRITICAL_FAILED: Cannot initialize HDFS via JVM bridge: {0}".format(e))
             raise RuntimeError("CRITICAL_FAILED: HDFS JVM initialization failed: {0}".format(e))
 
+    def _count_hdfs_parquet(self, hdfs_dir_obj):
+        """Count only .parquet files under the given HDFS directory and sum their sizes."""
+        counts = [0]
+        total_bytes = [0]
+
+        def _walk(path_obj):
+            statuses = self.fs.listStatus(path_obj)
+            for st in statuses:
+                if st.isFile() and st.getPath().getName().endswith('.parquet'):
+                    counts[0] += 1
+                    total_bytes[0] += st.getLen()
+                elif st.isDirectory():
+                    _walk(st.getPath())
+
+        _walk(hdfs_dir_obj)
+        return counts[0], total_bytes[0]
+
     def sync_parquet(self, local_file_path, hdfs_dest_path, table_logger=None, progress_callback=None):
         # Per-table logger enables detailed tracing without polluting the main log
         log = table_logger or self.logger
@@ -739,8 +756,29 @@ class HDFSHandler(object):
         except OSError as e:
             raise ValueError("FAILED: Cannot read local directory mtime: {0}".format(e))
 
-        local_dir_obj = self.Path("file:///" + os.path.abspath(local_file_path).replace("\\", "/").lstrip("/"))
         hdfs_dir_obj = self.Path(hdfs_dest_path)
+
+        # Build the local parquet manifest up front so count/size can be compared to HDFS
+        # before deciding whether an upload is actually needed.
+        file_pairs = []
+        abs_local = os.path.abspath(local_file_path)
+        for root, _dirs, files in os.walk(abs_local):
+            for fname in files:
+                if not fname.endswith('.parquet'):
+                    continue
+                local_abs = os.path.join(root, fname)
+                rel = os.path.relpath(local_abs, abs_local).replace("\\", "/")
+                hdfs_file = hdfs_dest_path.rstrip("/") + "/" + rel
+                file_pairs.append((local_abs, hdfs_file))
+
+        num_files = len(file_pairs)
+        file_size_map = {}
+        for local_abs, _ in file_pairs:
+            try:
+                file_size_map[local_abs] = os.path.getsize(local_abs)
+            except OSError:
+                file_size_map[local_abs] = 0
+        total_bytes = sum(file_size_map.values())
 
         needs_upload = False
 
@@ -750,15 +788,36 @@ class HDFSHandler(object):
             log.info("[HDFSHandler] HDFS destination does not exist. Will upload directory.")
         else:
             try:
-                hdfs_dir_mtime = self.fs.getFileStatus(hdfs_dir_obj).getModificationTime() / 1000.0
-                if local_dir_mtime > hdfs_dir_mtime:
+                hdfs_file_count, hdfs_total_bytes = self._count_hdfs_parquet(hdfs_dir_obj)
+                log.info(
+                    "[HDFSHandler] Pre-check: local={0} files / {1}B  |  hdfs={2} files / {3}B".format(
+                        num_files, total_bytes, hdfs_file_count, hdfs_total_bytes
+                    )
+                )
+
+                if hdfs_file_count < num_files or hdfs_total_bytes < total_bytes:
                     needs_upload = True
-                    log.info("[HDFSHandler] Local folder is newer (local={0:.0f} > hdfs={1:.0f}). Will replace HDFS directory.".format(
-                        local_dir_mtime, hdfs_dir_mtime))
+                    log.info(
+                        "[HDFSHandler] HDFS has fewer parquet files or bytes than local. Will replace HDFS directory."
+                    )
+                elif hdfs_file_count > num_files or hdfs_total_bytes > total_bytes:
+                    needs_upload = True
+                    log.warning(
+                        "[HDFSHandler] HDFS has MORE parquet files or bytes than local. Will replace HDFS directory."
+                    )
                 else:
-                    log.info("[HDFSHandler] HDFS directory is up-to-date. Skipping upload.")
+                    hdfs_dir_mtime = self.fs.getFileStatus(hdfs_dir_obj).getModificationTime() / 1000.0
+                    if local_dir_mtime > hdfs_dir_mtime:
+                        needs_upload = True
+                        log.info(
+                            "[HDFSHandler] Count and size match, but local folder is newer (local={0:.0f} > hdfs={1:.0f}). Will replace HDFS directory.".format(
+                                local_dir_mtime, hdfs_dir_mtime))
+                    else:
+                        log.info(
+                            "[HDFSHandler] Count, size, and mtime indicate HDFS is up-to-date. Skipping upload."
+                        )
             except Exception as e:
-                log.warning("[HDFSHandler] Cannot get HDFS directory mtime. Forcing upload. Error: {0}".format(e))
+                log.warning("[HDFSHandler] Cannot compare HDFS parquet stats. Forcing upload. Error: {0}".format(e))
                 needs_upload = True
 
         if needs_upload:
@@ -773,20 +832,6 @@ class HDFSHandler(object):
                 if hdfs_parent and not self.fs.exists(hdfs_parent):
                     self.fs.mkdirs(hdfs_parent)
 
-                # Collect only .parquet files — excludes .crc sidecars so the upload
-                # set, byte counter, and post-upload verification are all consistent.
-                file_pairs = []
-                abs_local = os.path.abspath(local_file_path)
-                for root, _dirs, files in os.walk(abs_local):
-                    for fname in files:
-                        if not fname.endswith('.parquet'):
-                            continue
-                        local_abs = os.path.join(root, fname)
-                        rel = os.path.relpath(local_abs, abs_local).replace("\\", "/")
-                        hdfs_file = hdfs_dest_path.rstrip("/") + "/" + rel
-                        file_pairs.append((local_abs, hdfs_file))
-
-                num_files = len(file_pairs)
                 parallelism = min(self._put_parallel, num_files) if num_files > 0 else 1
                 log.info("[HDFSHandler] Uploading {0} files: {1} -> {2} (parallelism={3})".format(
                     num_files, local_file_path, hdfs_dest_path, parallelism))
@@ -809,15 +854,6 @@ class HDFSHandler(object):
                     file_queue = Queue.Queue()
                     for pair in file_pairs:
                         file_queue.put(pair)
-
-                    # Pre-compute per-file sizes for dashboard byte counter
-                    file_size_map = {}
-                    for local_abs, _ in file_pairs:
-                        try:
-                            file_size_map[local_abs] = os.path.getsize(local_abs)
-                        except OSError:
-                            file_size_map[local_abs] = 0
-                    total_bytes = sum(file_size_map.values())
 
                     upload_errors = []  # list.append() is GIL-safe in CPython
                     upload_errors_lock = threading.Lock()
@@ -1828,13 +1864,16 @@ class UploadWorker(threading.Thread):
 
                 # Step 2: Sync to HDFS with per-table log and dashboard progress callback
                 hdfs_dest = os.path.join(self.config.hdfs_path, db, schema, partition)
-                self.hdfs_h.sync_parquet(
+                uploaded, _upload_duration = self.hdfs_h.sync_parquet(
                     local_file_path, hdfs_dest,
                     table_logger=table_logger,
                     progress_callback=_progress_cb)
 
                 status = "SUCCESS"
-                remark = "HDFS synced: {0}".format(hdfs_dest)
+                if uploaded:
+                    remark = "HDFS synced: {0}".format(hdfs_dest)
+                else:
+                    remark = "HDFS up-to-date, skipped upload: {0}".format(hdfs_dest)
                 self.tracker.add_result(partition, status, time.time() - start_t, remark)
 
             except ValueError as ve:
