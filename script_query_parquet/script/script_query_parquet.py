@@ -686,6 +686,23 @@ class HDFSHandler(object):
             self.logger.critical("CRITICAL_FAILED: Cannot initialize HDFS via JVM bridge: {0}".format(e))
             raise RuntimeError("CRITICAL_FAILED: HDFS JVM initialization failed: {0}".format(e))
 
+    def _count_hdfs_parquet(self, hdfs_dir_obj):
+        """Count only .parquet files under the given HDFS directory and sum their sizes."""
+        counts = [0]
+        total_bytes = [0]
+
+        def _walk(path_obj):
+            statuses = self.fs.listStatus(path_obj)
+            for st in statuses:
+                if st.isFile() and st.getPath().getName().endswith('.parquet'):
+                    counts[0] += 1
+                    total_bytes[0] += st.getLen()
+                elif st.isDirectory():
+                    _walk(st.getPath())
+
+        _walk(hdfs_dir_obj)
+        return counts[0], total_bytes[0]
+
     def sync_parquet(self, local_file_path, hdfs_dest_path, table_logger=None, progress_callback=None):
         # Per-table logger enables detailed tracing without polluting the main log
         log = table_logger or self.logger
@@ -739,8 +756,29 @@ class HDFSHandler(object):
         except OSError as e:
             raise ValueError("FAILED: Cannot read local directory mtime: {0}".format(e))
 
-        local_dir_obj = self.Path("file:///" + os.path.abspath(local_file_path).replace("\\", "/").lstrip("/"))
         hdfs_dir_obj = self.Path(hdfs_dest_path)
+
+        # Build the local parquet manifest up front so count/size can be compared to HDFS
+        # before deciding whether an upload is actually needed.
+        file_pairs = []
+        abs_local = os.path.abspath(local_file_path)
+        for root, _dirs, files in os.walk(abs_local):
+            for fname in files:
+                if not fname.endswith('.parquet'):
+                    continue
+                local_abs = os.path.join(root, fname)
+                rel = os.path.relpath(local_abs, abs_local).replace("\\", "/")
+                hdfs_file = hdfs_dest_path.rstrip("/") + "/" + rel
+                file_pairs.append((local_abs, hdfs_file))
+
+        num_files = len(file_pairs)
+        file_size_map = {}
+        for local_abs, _ in file_pairs:
+            try:
+                file_size_map[local_abs] = os.path.getsize(local_abs)
+            except OSError:
+                file_size_map[local_abs] = 0
+        total_bytes = sum(file_size_map.values())
 
         needs_upload = False
 
@@ -750,15 +788,36 @@ class HDFSHandler(object):
             log.info("[HDFSHandler] HDFS destination does not exist. Will upload directory.")
         else:
             try:
-                hdfs_dir_mtime = self.fs.getFileStatus(hdfs_dir_obj).getModificationTime() / 1000.0
-                if local_dir_mtime > hdfs_dir_mtime:
+                hdfs_file_count, hdfs_total_bytes = self._count_hdfs_parquet(hdfs_dir_obj)
+                log.info(
+                    "[HDFSHandler] Pre-check: local={0} files / {1}B  |  hdfs={2} files / {3}B".format(
+                        num_files, total_bytes, hdfs_file_count, hdfs_total_bytes
+                    )
+                )
+
+                if hdfs_file_count < num_files or hdfs_total_bytes < total_bytes:
                     needs_upload = True
-                    log.info("[HDFSHandler] Local folder is newer (local={0:.0f} > hdfs={1:.0f}). Will replace HDFS directory.".format(
-                        local_dir_mtime, hdfs_dir_mtime))
+                    log.info(
+                        "[HDFSHandler] HDFS has fewer parquet files or bytes than local. Will replace HDFS directory."
+                    )
+                elif hdfs_file_count > num_files or hdfs_total_bytes > total_bytes:
+                    needs_upload = True
+                    log.warning(
+                        "[HDFSHandler] HDFS has MORE parquet files or bytes than local. Will replace HDFS directory."
+                    )
                 else:
-                    log.info("[HDFSHandler] HDFS directory is up-to-date. Skipping upload.")
+                    hdfs_dir_mtime = self.fs.getFileStatus(hdfs_dir_obj).getModificationTime() / 1000.0
+                    if local_dir_mtime > hdfs_dir_mtime:
+                        needs_upload = True
+                        log.info(
+                            "[HDFSHandler] Count and size match, but local folder is newer (local={0:.0f} > hdfs={1:.0f}). Will replace HDFS directory.".format(
+                                local_dir_mtime, hdfs_dir_mtime))
+                    else:
+                        log.info(
+                            "[HDFSHandler] Count, size, and mtime indicate HDFS is up-to-date. Skipping upload."
+                        )
             except Exception as e:
-                log.warning("[HDFSHandler] Cannot get HDFS directory mtime. Forcing upload. Error: {0}".format(e))
+                log.warning("[HDFSHandler] Cannot compare HDFS parquet stats. Forcing upload. Error: {0}".format(e))
                 needs_upload = True
 
         if needs_upload:
@@ -773,20 +832,6 @@ class HDFSHandler(object):
                 if hdfs_parent and not self.fs.exists(hdfs_parent):
                     self.fs.mkdirs(hdfs_parent)
 
-                # Collect only .parquet files — excludes .crc sidecars so the upload
-                # set, byte counter, and post-upload verification are all consistent.
-                file_pairs = []
-                abs_local = os.path.abspath(local_file_path)
-                for root, _dirs, files in os.walk(abs_local):
-                    for fname in files:
-                        if not fname.endswith('.parquet'):
-                            continue
-                        local_abs = os.path.join(root, fname)
-                        rel = os.path.relpath(local_abs, abs_local).replace("\\", "/")
-                        hdfs_file = hdfs_dest_path.rstrip("/") + "/" + rel
-                        file_pairs.append((local_abs, hdfs_file))
-
-                num_files = len(file_pairs)
                 parallelism = min(self._put_parallel, num_files) if num_files > 0 else 1
                 log.info("[HDFSHandler] Uploading {0} files: {1} -> {2} (parallelism={3})".format(
                     num_files, local_file_path, hdfs_dest_path, parallelism))
@@ -809,15 +854,6 @@ class HDFSHandler(object):
                     file_queue = Queue.Queue()
                     for pair in file_pairs:
                         file_queue.put(pair)
-
-                    # Pre-compute per-file sizes for dashboard byte counter
-                    file_size_map = {}
-                    for local_abs, _ in file_pairs:
-                        try:
-                            file_size_map[local_abs] = os.path.getsize(local_abs)
-                        except OSError:
-                            file_size_map[local_abs] = 0
-                    total_bytes = sum(file_size_map.values())
 
                     upload_errors = []  # list.append() is GIL-safe in CPython
                     upload_errors_lock = threading.Lock()
@@ -1113,8 +1149,12 @@ class Worker(threading.Thread):
         self.logger.info("[{0}] Logging status to directory: {1}".format(self.name, status_dir))
         #self.status = status
 
-        remark = "-" if status.upper() == "SUCCESS" else remark
         statused = "SUCCEEDED" if status.upper() == "SUCCESS" else status
+        # Route the incoming remark to the correct column based on final status:
+        # error_message (col 6) — filled when the table FAILED; otherwise "-"
+        # remark_col    (col 9) — filled when the table was SKIPPED; otherwise "-"
+        error_message = remark if statused == "FAILED" else "-"
+        remark_col    = remark if statused == "SKIPPED" else "-"
 
         # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
@@ -1176,9 +1216,10 @@ class Worker(threading.Thread):
             duration_str, 
             reconcile_method_str, 
             statused, 
-            remark, 
+            error_message, 
             nas_json_path, 
-            hdfs_path
+            hdfs_path,
+            remark_col
             ] 
 
         row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
@@ -1351,7 +1392,7 @@ class Worker(threading.Thread):
         # Sort by end_ts (col [2], '%Y-%m-%d %H:%M:%S') — ISO lexicographic order is deterministic
         all_rows.sort(key=lambda r: r[2].strip())
         latest = all_rows[-1]
-        return (latest[9].strip(), latest[5].strip())
+        return (latest[8].strip(), latest[5].strip())
 
     def _hdfs_has_parquet(self, hdfs_path):
         """Return True if at least one .parquet file exists anywhere under hdfs_path.
@@ -1662,46 +1703,86 @@ class UploadWorker(threading.Thread):
         self.status = ""
         self.error_message = ""
 
-    def logging_status(self, status, remark="", hdfs_path=""):
+    def logging_status(self, status, remark="-", nas_json_path="-", hdfs_path="-"):
+        # 1. Define directory path
+        # temp status directory: /output/<date>/stat_csv/<db>/<schema>
         status_dir = os.path.join(self.config.local_temp_dir, 'stat_csv', self.db, self.schema)
-        self.logger.info("[{0}] Logging status to: {1}".format(self.name, status_dir))
+        self.logger.info("[{0}] Logging status to directory: {1}".format(self.name, status_dir))
 
-        remark = "-" if status.upper() == "SUCCESS" else remark
         statused = "SUCCEEDED" if status.upper() == "SUCCESS" else status
+        # Route the incoming remark to the correct column based on final status:
+        # error_message (col 6) — filled when the table FAILED; otherwise "-"
+        # remark_col    (col 9) — filled when the table was SKIPPED; otherwise "-"
+        error_message = remark if statused == "FAILED" else "-"
+        remark_col    = remark if statused == "SKIPPED" else "-"
 
+        # 2. Directory creation with Race Condition handling
         if not os.path.exists(status_dir):
             try:
                 os.makedirs(status_dir)
             except OSError as e:
+                # errno.EEXIST is Error code 17 (File exists)
+                # If the directory was created by another thread just now, ignore the error
                 if e.errno != errno.EEXIST:
-                    self.logger.critical("Cannot create directory {0}: {1}".format(status_dir, e))
+                    self.logger.critical("Cannot create directory {0}. Error: {1}".format(status_dir, e))
                     return
             except Exception as e:
                 self.logger.error("Unexpected error creating directory: {0}".format(e))
                 return
+        self.logger.info("[{0}] Directory created successfully: {1}".format(self.name, status_dir))
 
         status_file_full_path = os.path.join(status_dir, self.status_file_filenm)
 
+        # 3. Thread-safe lock acquisition (Optimized using setdefault)
+        # Acquire or create a per-file lock (shared across all workers) to prevent race conditions
         with self.status_file_locks_lock:
             lock = self.status_file_locks.setdefault(status_file_full_path, threading.Lock())
+        self.logger.info("[{0}] Acquired lock for file: {1}".format(self.name, status_file_full_path))
 
+        # 4. Attribute retrieval with getattr
         short_name = getattr(self, "short_name", "")
         start_ts = getattr(self, "start_ts_tbl", "")
         reconcile_method = getattr(self, "reconcile_method", [])
+        self.logger.info("[{0}] Retrieved attributes for logging. Short Name: {1}, Start TS: {2}, Status: {3}".format(
+            self.name, short_name, start_ts, statused
+        ))
 
+        # 5. Timing & Duration calculation
         curr_time = time.time()
         start_time = getattr(self, "start_time_tbl", None)
-        duration_sec = int(max(0, curr_time - start_time)) if start_time is not None else 0
+
+        if start_time is not None:
+            duration_sec = int(max(0, curr_time - start_time))
+        else:
+            duration_sec = 0
+
         hours, rem = divmod(duration_sec, 3600)
         minutes, seconds = divmod(rem, 60)
         duration_str = "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
         end_ts = datetime.fromtimestamp(curr_time).strftime("%Y-%m-%d %H:%M:%S")
+        self.logger.info("[{0}] Calculated duration: {1}".format(self.name, duration_str))
 
+        # 6. Reconcile method formatting
         reconcile_method_str = ",".join(set(reconcile_method)) if reconcile_method else ""
 
-        row = [short_name, start_ts, end_ts, duration_str, reconcile_method_str, statused, remark, "", "", hdfs_path]
+        # 7. Construct and encode row
+        row = [
+            short_name,
+            start_ts, end_ts,
+            duration_str,
+            reconcile_method_str,
+            statused,
+            error_message,
+            nas_json_path,
+            hdfs_path,
+            remark_col
+            ]
+
         row = [s.encode('utf-8') if isinstance(s, unicode) else str(s) for s in row]
 
+        self.logger.info("Prepared log row for {0}: {1}".format(self.name, row))
+
+        # 8. Thread-safe file writing (Using binary mode 'ab' for Python 2.7)
         with lock:
             try:
                 with open(status_file_full_path, "ab") as f:
@@ -1783,13 +1864,16 @@ class UploadWorker(threading.Thread):
 
                 # Step 2: Sync to HDFS with per-table log and dashboard progress callback
                 hdfs_dest = os.path.join(self.config.hdfs_path, db, schema, partition)
-                self.hdfs_h.sync_parquet(
+                uploaded, _upload_duration = self.hdfs_h.sync_parquet(
                     local_file_path, hdfs_dest,
                     table_logger=table_logger,
                     progress_callback=_progress_cb)
 
                 status = "SUCCESS"
-                remark = "HDFS synced: {0}".format(hdfs_dest)
+                if uploaded:
+                    remark = "HDFS synced: {0}".format(hdfs_dest)
+                else:
+                    remark = "HDFS up-to-date, skipped upload: {0}".format(hdfs_dest)
                 self.tracker.add_result(partition, status, time.time() - start_t, remark)
 
             except ValueError as ve:
@@ -1831,7 +1915,7 @@ class UploadWorker(threading.Thread):
                     pass
 
                 try:
-                    self.logging_status(status, remark, hdfs_dest)
+                    self.logging_status(status, remark, "-", hdfs_dest)
                 except Exception as e:
                     self.logger.error("Failed writing logging_status for {0}: {1}".format(full_name, e))
                 self.queue.task_done()
