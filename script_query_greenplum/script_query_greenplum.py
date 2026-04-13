@@ -727,12 +727,11 @@ class ShellHandler(object):
                         target = os.readlink(fd_path)
                         fd_list.append("{0}->{1}".format(fd_name, target))
                     except OSError:
-                        pass # Ignore if the FD was closed rapidly before we could read the symlink
+                        pass
                 
                 fd_details = ", ".join(fd_list)
                 self.logger.info("{0} [FD Detail]        Child {1} holds FDs: {2}".format(log_prefix, child_pid, fd_details))
             except OSError as e:
-                # Handle cases where the process finished and exited before Python could read /proc
                 self.logger.info("{0} [FD Detail]        Could not read {1} (Process may have finished instantly): {2}".format(log_prefix, fd_dir, e))
 
             stdout, stderr = process.communicate()
@@ -813,13 +812,23 @@ class Worker(threading.Thread):
         matches_dt = []
         matches_il = []
         
-        # Walk through directories to find the most recent file
-        for root, _, files in os.walk(target_dir):
-            for file in files:
-                if file.endswith("_data_type.txt") and schema_table in file:
-                    matches_dt.append(os.path.join(root, file))
-                elif file.endswith("_insert_logic.txt") and schema_table in file:
-                    matches_il.append(os.path.join(root, file))
+        try:
+            schema = schema_table.split('.')[0]
+        except Exception:
+            schema = "*"
+
+        search_pattern = os.path.join(target_dir, '*', schema, "*")
+        candidate_files = glob.glob(search_pattern)
+
+        pattern_dt = r"^{0}_\d{{8}}_\d{{6}}_data_type\.txt$".format(re.escape(schema_table))
+        pattern_il = r"^{0}_\d{{8}}_\d{{6}}_insert_logic\.txt$".format(re.escape(schema_table))
+        
+        for fpath in candidate_files:
+            filename = os.path.basename(fpath)
+            if re.match(pattern_dt, filename):
+                matches_dt.append(fpath)
+            elif re.match(pattern_il, filename):
+                matches_il.append(fpath)
                     
         latest_dt = sorted(matches_dt)[-1] if matches_dt else None
         latest_il = sorted(matches_il)[-1] if matches_il else None
