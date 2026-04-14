@@ -174,16 +174,18 @@ class LogParser(object):
                                         continue
                                     
                                     if gp_tbl:
-                                        prev = self.cache[cache_key].get(gp_tbl)
+                                        gp_tbl_key = gp_tbl.strip().lower()
+                                        prev = self.cache[cache_key].get(gp_tbl_key)
                                         if prev is None or new_end_ts > prev.get('End_Timestamp_Script', ''):
-                                            self.cache[cache_key][gp_tbl] = row
+                                            self.cache[cache_key][gp_tbl_key] = row
                                             
                         except Exception as e:
                             self.logger.warning("[LogParser] Error parsing log file {0}: {1}".format(log_file, e))
                 self.logger.info("[LogParser] Cache build completed. Total {0} tables cached.".format(len(self.cache[cache_key])))
 
         # Check partition/table name against cache
-        target_table_with_schema = "{0}.{1}".format(schema, table)
+        target_short = table.strip().lower()
+        target_table_with_schema = "{0}.{1}".format(schema, target_short).lower()
         latest_row = self.cache[cache_key].get(table) or self.cache[cache_key].get(target_table_with_schema)
         
         if latest_row:
@@ -191,7 +193,7 @@ class LogParser(object):
             latest_hive_tbl = latest_row.get('Hive_Tbl', '').lower()
             if latest_status == 'SUCCEEDED':
                 self.logger.info("[LogParser] Found latest Export status = SUCCEEDED for {0} from Cache.".format(table))
-                return latest_status, "Found latest Export Status = SUCCEEDED", latest_hive_tbl
+                return latest_row, "Found latest Export Status = SUCCEEDED", latest_hive_tbl
             else:
                 self.logger.warning("[LogParser] Latest status of table: {0} is not SUCCEEDED (status = {1})".format(table, latest_status))
                 return None, "Latest Export status is not SUCCEEDED", None
@@ -825,9 +827,9 @@ class Worker(threading.Thread):
         
         for fpath in candidate_files:
             filename = os.path.basename(fpath)
-            if re.match(pattern_dt, filename):
+            if re.match(pattern_dt, filename, re.IGNORECASE):
                 matches_dt.append(fpath)
-            elif re.match(pattern_il, filename):
+            elif re.match(pattern_il, filename, re.IGNORECASE):
                 matches_il.append(fpath)
                     
         latest_dt = sorted(matches_dt)[-1] if matches_dt else None
@@ -984,6 +986,9 @@ class Worker(threading.Thread):
                         log_row, log_msg, log_hive_tbl = self.log_parser.get_latest_succeed_info(self.db, self.schema, table)
                         if not log_row:
                             raise ValueError(log_msg)
+                        gp_tbl_original = log_row.get('Greenplum_Tbl', '')
+                        original_table = gp_tbl_original.split('.')[-1] if '.' in gp_tbl_original else gp_tbl_original
+                        if not original_table: original_table = table
 
                         # Step 2: Config and Metadata
                         pre_master_info = self.config.master_data.get((self.db, self.schema, table), {'manual_num': []})
@@ -1092,7 +1097,7 @@ class Worker(threading.Thread):
                                                 self.reconcile_method.append('md5_min_max')
 
                             # Call JSON builder and save as .json file
-                            sql_file = self.builder.build_json_query(self.db, self.schema, table, cat_cols, insert_logic_dict, self.config.ctas_schema, self.ctas_table)
+                            sql_file = self.builder.build_json_query(self.db, self.schema, original_table, cat_cols, insert_logic_dict, self.config.ctas_schema, self.ctas_table)
                             output_filename = "gp_{0}_{1}_{2}_{3}.json".format(self.db, self.schema, table, self.global_ts)
                             local_path = os.path.join(self.config.local_temp_dir, output_filename)
                             json_output_dir = os.path.join(self.config.nas_dest_base, self.db, self.schema)
