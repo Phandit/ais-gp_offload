@@ -494,14 +494,22 @@ class SparkQueryBuilder(object):
         gp_base = gp_type.split('(')[0].strip().lower()
         
         # 1. Defaults
-        p, s, r = 38, 10, 10 
+        p, s, r = 38, 10, 5
 
         if gp_base == 'numeric' and '(' in gp_type:
             try:
                 ps = gp_type.split('(')[1].replace(')', '').split(',')
-                p = int(ps[0].strip())
-                s = int(ps[1].strip())
-                r = s # SLA: Rounding equals scale if defined
+                parsed_p = int(ps[0].strip())
+                parsed_s = int(ps[1].strip())
+                
+                if parsed_p > 38:
+                    p = 38
+                    s = min(parsed_s, 38)
+                    r = s
+                else:
+                    p = parsed_p
+                    s = parsed_s
+                    r = s # SLA: Rounding equals scale if defined
             except: pass
         elif gp_base == 'numeric':
             p, s, r = self.env_params['default_numeric_p'], self.env_params['default_numeric_s'], self.env_params['round_numeric']
