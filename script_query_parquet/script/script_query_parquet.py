@@ -494,14 +494,22 @@ class SparkQueryBuilder(object):
         gp_base = gp_type.split('(')[0].strip().lower()
         
         # 1. Defaults
-        p, s, r = 38, 10, 10 
+        p, s, r = 38, 10, 5
 
         if gp_base == 'numeric' and '(' in gp_type:
             try:
                 ps = gp_type.split('(')[1].replace(')', '').split(',')
-                p = int(ps[0].strip())
-                s = int(ps[1].strip())
-                r = s # SLA: Rounding equals scale if defined
+                parsed_p = int(ps[0].strip())
+                parsed_s = int(ps[1].strip())
+                
+                if parsed_p > 38:
+                    p = 38
+                    s = min(parsed_s, 38)
+                    r = s
+                else:
+                    p = parsed_p
+                    s = parsed_s
+                    r = s # SLA: Rounding equals scale if defined
             except: pass
         elif gp_base == 'numeric':
             p, s, r = self.env_params['default_numeric_p'], self.env_params['default_numeric_s'], self.env_params['round_numeric']
@@ -643,18 +651,20 @@ class LogParser(object):
                                         continue
                                     
                                     if gp_tbl:
-                                        if gp_tbl not in self.cache[cache_key]:
-                                            self.cache[cache_key][gp_tbl] = row
+                                        gp_tbl_key = gp_tbl.strip().lower()
+                                        if gp_tbl_key not in self.cache[cache_key]:
+                                            self.cache[cache_key][gp_tbl_key] = row
                                         else:
-                                            current_ts = self.cache[cache_key][gp_tbl].get('End_Timestamp_Script', '')
+                                            current_ts = self.cache[cache_key][gp_tbl_key].get('End_Timestamp_Script', '')
                                             new_ts = row.get('End_Timestamp_Script', '')
                                             if new_ts > current_ts:
-                                                self.cache[cache_key][gp_tbl] = row
+                                                self.cache[cache_key][gp_tbl_key] = row
                         except Exception as e:
                             self.logger.warning("[LogParser] Error parsing log file {0}: {1}".format(log_file, e))
                 self.logger.info("[LogParser] Cache build completed. Total {0} tables cached.".format(len(self.cache[cache_key])))
 
-        target_table_with_schema = "{0}.{1}".format(schema, partition)
+        target_short = partition.strip().lower()
+        target_table_with_schema = "{0}.{1}".format(schema, target_short).lower()
         latest_row = self.cache[cache_key].get(partition) or self.cache[cache_key].get(target_table_with_schema)
         # self.logger.info(latest_row)
         if latest_row and latest_row.get('Run_Status') == 'SUCCEEDED':
@@ -1011,11 +1021,24 @@ class MetadataFetcher(object):
         self.base_dir = base_dir
         self.logger = logger
 
-    def fetch_data_types(self, db_name, table_name):
-        if not self.base_dir or not os.path.exists(self.base_dir): return None
+    def fetch_data_types(self, db_name, schema_name, table_name):
+        if not self.base_dir or not os.path.exists(self.base_dir): return None, None
         target_dir = os.path.join(self.base_dir, db_name)
-        if not os.path.exists(target_dir): return None
-        matches = [os.path.join(r, f) for r, _, fs in os.walk(target_dir) for f in fs if f.endswith("_data_type.txt") and table_name in f]
+        if not os.path.exists(target_dir): return None, None
+        
+        search_pattern = os.path.join(target_dir, '*', schema_name, "*_data_type.txt")
+        candidate_files = glob.glob(search_pattern)
+        
+        pattern = r"^{0}\.{1}(?:_1_prt_[a-zA-Z0-9_]+)?_\d{{8}}_\d{{6}}_data_type\.txt$".format(
+            re.escape(schema_name), re.escape(table_name)
+        )
+        
+        matches = []
+        for fpath in candidate_files:
+            filename = os.path.basename(fpath)
+            if re.match(pattern, filename):
+                matches.append(fpath)
+        
         latest_file = sorted(matches)[-1] if matches else None
   
         type_map = {}
@@ -1031,8 +1054,9 @@ class MetadataFetcher(object):
                             type_map[col_nm.lower()] = gp_dt
             except Exception as e:
                 self.logger.warning("Error reading data type file {0}: {1}".format(latest_file, e))
-                return None
-        return type_map
+                return None, None
+                
+        return type_map, latest_file
 
 class HiveLogger(object):
     def __init__(self, spark_session, logger):
@@ -1389,8 +1413,8 @@ class Worker(threading.Thread):
         reconcile_method contains 'hdfs_sync'; sort by end_ts (col[2]) to get the
         chronologically latest row; return (hdfs_path, status). Returns ('','') if
         no matching row is found across all stat files."""
-        stat_dir = os.path.join(self.config.local_temp_dir, 'stat_csv', db, schema)
-        pattern = os.path.join(stat_dir, 'log_stat_rc_*.csv')
+        base_temp_dir = os.path.dirname(self.config.local_temp_dir)
+        pattern = os.path.join(base_temp_dir, '*', 'stat_csv', db, schema, 'log_stat_rc_*.csv')
         matched_files = glob.glob(pattern)
         target_short = "{0}.{1}".format(schema, partition)
         all_rows = []
@@ -1505,7 +1529,9 @@ class Worker(threading.Thread):
                 self.worker_logger.info("[{0}] HDFS pre-check passed: {1}".format(self.name, hdfs_dest))
 
                 # Step 3: Fetch Metadata & Categorize
-                type_map = self.meta_fetcher.fetch_data_types(db, base_table)
+                type_map, meta_file_path = self.meta_fetcher.fetch_data_types(db, schema, base_table)
+                self.worker_logger.info("[{0}] Metadata file used: {1}".format(self.name, meta_file_path))
+                self.worker_logger.info("[{0}] Mapping logic used: {1}".format(self.name, self.config.mapping_file_path))
                 missing_meta = True if type_map is None else False
                 type_map = type_map or {}
 
