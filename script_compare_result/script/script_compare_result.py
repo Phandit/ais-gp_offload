@@ -1053,6 +1053,15 @@ if __name__ == "__main__":
     current_script_dir = os.path.dirname(os.path.abspath(__file__))
     main_path = os.path.dirname(current_script_dir)
 
+    def resolve_config_path(input_path, base_dir):
+        if not input_path:
+            return input_path
+        if os.path.isabs(input_path):
+            return input_path
+        if os.path.dirname(input_path):
+            return input_path
+        return os.path.join(base_dir, 'config', input_path)
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', default='env_config.txt')
     parser.add_argument('--concurrency', default=4, type=int)
@@ -1067,9 +1076,9 @@ if __name__ == "__main__":
     if not args.list and not args.table_name:
         args.list = 'list_table.txt'
 
-    args.env = os.path.join(main_path, 'config', os.path.basename(args.env))
+    args.env = resolve_config_path(args.env, main_path)
     if args.list:
-        args.list = os.path.join(main_path, 'config', os.path.basename(args.list))
+        args.list = resolve_config_path(args.list, main_path)
 
     global_date = datetime.now().strftime("%Y%m%d")
     global_ts = datetime.now().strftime("%Y%m%d_%H%M%S")

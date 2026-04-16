@@ -166,6 +166,22 @@ def setup_logging(log_dir, log_name="app", timestamp=None, run_id=None):
     logger.addHandler(fh)
     return logger, log_file
 
+def parse_source_count(source_count_raw, logger=None, log_prefix=""):
+    """Parse record count from offload stat row; return int or None when invalid/empty."""
+    raw = "" if source_count_raw is None else str(source_count_raw).strip()
+    if raw == "":
+        return None
+
+    try:
+        return int(raw)
+    except Exception:
+        try:
+            return int(Decimal(raw))
+        except Exception:
+            if logger:
+                logger.warning("{0} Invalid record count '{1}'. Continue normal flow.".format(log_prefix, raw))
+            return None
+
 # ==============================================================================
 # 2. Configuration Class
 # ==============================================================================
@@ -631,12 +647,11 @@ class LogParser(object):
                     raise RuntimeError("CRITICAL_FAILED: Log files not found for pattern: {0}".format(search_pattern))
                 else:
                     expected_fields = [
-                        "Run_ID", "Greenplum_Tbl", "Hive_Tbl", 
-                        "Start_Timestamp_Script", "End_Timestamp_Script", "Duration_Script", 
-                        "Start_Timestamp_Spark", "End_Timestamp_Spark", "Duration_Spark", 
-                        "Run_Status", "Error_Message", "Source_Count", 
-                        "Target_Count", "Size", "Avg_Row_Len", 
-                        "File_Path", "Remark"
+                        "ExecutionId", "Greenplum_Tbl", "External_Tbl",
+                        "Start_Timestamp_Script", "End_Timestamp_Script", "Duration_Script",
+                        "Start_Timestamp_Insert_Ext_Tbl", "End_Timestamp_Insert_Ext_Tbl", "Duration_Insert_Ext_Tbl",
+                        "Run_Status", "Error_Message", "Greenplum_Tbl_Size", "Greenplum_Num_Record",
+                        "Ext_Tbl_Folder_Size", "Ext_Tbl_Num_File", "File_Path", "Remark", "Parent_Tbl_Nm"
                     ]
                     for log_file in matched_files:
                         self.logger.info("[LogParser] Scanning log file into cache: {0}".format(log_file))
@@ -1412,7 +1427,21 @@ class Worker(threading.Thread):
         """Scan log_stat_rc_*.csv files; collect all rows for this partition where
         reconcile_method contains 'hdfs_sync'; sort by end_ts (col[2]) to get the
         chronologically latest row; return (hdfs_path, status). Returns ('','') if
-        no matching row is found across all stat files."""
+        no matching row is found across all stat files.
+
+        POSITIONAL CONTRACT — do NOT reorder logging_status() columns; query mode
+        reads upload-mode stat rows by fixed index:
+          row[0] = short_name (schema.partition)   <- partition match filter
+          row[1] = start_ts
+          row[2] = end_ts                           <- used for latest-row sort
+          row[3] = duration_str
+          row[4] = reconcile_method_str             <- filtered for 'hdfs_sync'
+          row[5] = statused                         <- returned as sync status
+          row[6] = error_message
+          row[7] = nas_json_path
+          row[8] = hdfs_path                        <- returned as hdfs_dest
+          row[9] = remark_col
+        """
         base_temp_dir = os.path.dirname(self.config.local_temp_dir)
         pattern = os.path.join(base_temp_dir, '*', 'stat_csv', db, schema, 'log_stat_rc_*.csv')
         matched_files = glob.glob(pattern)
@@ -1515,18 +1544,30 @@ class Worker(threading.Thread):
                 if not log_row:
                     raise ValueError(log_msg)
 
+                # Only new offloadgp_stat schema exists — read count from canonical field
+                source_count = parse_source_count(
+                    log_row.get('Greenplum_Num_Record', ''),
+                    self.worker_logger,
+                    "[{0}]".format(self.name)
+                )
+                source_is_zero = (source_count == 0)
+
                 # Step 2: Verify HDFS sync record exists and is SUCCEEDED, then confirm .parquet files present
-                hdfs_from_stat, sync_status = self._read_hdfs_sync_status(db, schema, partition)
-                if not sync_status:
-                    raise ValueError("SKIPPED: No HDFS sync record found for {0}".format(partition))
-                if sync_status != "SUCCEEDED":
-                    raise ValueError("FAILED: Latest status of HDFS Sync is not SUCCEEDED.")
-                hdfs_dest = hdfs_from_stat
-                # True = at least one .parquet file was found anywhere under the HDFS path
-                parquet_files_exist = self._hdfs_has_parquet(hdfs_dest)
-                if parquet_files_exist == False:
-                    raise ValueError("FAILED: No .parquet files at HDFS path: {0}".format(hdfs_dest))
-                self.worker_logger.info("[{0}] HDFS pre-check passed: {1}".format(self.name, hdfs_dest))
+                if not source_is_zero:
+                    hdfs_from_stat, sync_status = self._read_hdfs_sync_status(db, schema, partition)
+                    if not sync_status:
+                        raise ValueError("SKIPPED: No HDFS sync record found for {0}".format(partition))
+                    if sync_status != "SUCCEEDED":
+                        raise ValueError("FAILED: Latest status of HDFS Sync is not SUCCEEDED.")
+                    hdfs_dest = hdfs_from_stat
+                    # True = at least one .parquet file was found anywhere under the HDFS path
+                    parquet_files_exist = self._hdfs_has_parquet(hdfs_dest)
+                    if parquet_files_exist == False:
+                        raise ValueError("FAILED: No .parquet files at HDFS path: {0}".format(hdfs_dest))
+                    self.worker_logger.info("[{0}] HDFS pre-check passed: {1}".format(self.name, hdfs_dest))
+                else:
+                    hdfs_dest = "-"
+                    self.worker_logger.info("[{0}] Source_Count=0. Skip HDFS parquet checks and build null-structured JSON.".format(self.name))
 
                 # Step 3: Fetch Metadata & Categorize
                 type_map, meta_file_path = self.meta_fetcher.fetch_data_types(db, schema, base_table)
@@ -1572,59 +1613,91 @@ class Worker(threading.Thread):
                             cat_cols['MD5_MIN_MAX'].append(col)
                             self.reconcile_method.append('md5_min_max')
 
-                # Step 4: Build & Execute SparkSQL Expressions
-                self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
-                parquet_read_path = self._resolve_parquet_path(hdfs_dest)
-                df = self.spark.read.parquet(parquet_read_path)
-                self._log_reconcile_column_usage(partition, cat_cols, df.dtypes)
-
                 agg_exprs = self.query_builder.build_agg_exprs(cat_cols)
-                
-                self.worker_logger.info("Worker {0} executing Spark Action for {1}...".format(self.name, partition))
-                
-                agg_result = df.agg(*agg_exprs).collect()
-                if not agg_result:
-                    raise RuntimeError("Spark aggregation returned empty result for {0}".format(partition))
 
-                sp_row = agg_result[0]
-                
-                sp_res = sp_row.asDict()
-                self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
-
-                def format_val(v):
-                    if v is None: return None
-                    v_str = str(v)
-                    if 'E' in v_str or 'e' in v_str:
-                        try:
-                            return "{:f}".format(Decimal(v_str))
-                        except Exception:
-                            pass
-                    return v
-                
+                # Step 4: Build Result JSON
                 final_json = collections.OrderedDict()
                 final_json["table"] = "{0}.{1}.{2}".format(db, schema, partition)
                 final_json["source_type"] = "parquet"
-                final_json["count"] = int(sp_res.pop("count", 0))
                 final_json["methods"] = collections.OrderedDict()
-                
-                parsed_res = {}
-                for k, v in sp_res.items():
-                    parts = k.split('|')
-                    if len(parts) == 3:
-                        method, col, func = parts
-                        if method not in parsed_res: parsed_res[method] = {}
-                        if col not in parsed_res[method]: parsed_res[method][col] = {}
-                        parsed_res[method][col][func] = format_val(v)
 
-                for method in ["SUM_MIN_MAX", "MIN_MAX", "MD5_MIN_MAX"]:
-                    if method in parsed_res:
-                        final_json["methods"][method] = collections.OrderedDict()
-                        for col in sorted(parsed_res[method].keys()):
-                            final_json["methods"][method][col] = collections.OrderedDict()
-                            final_json["methods"][method][col]["data_type"] = type_map.get(col, "unknown")
-                            for f in ["sum", "min", "max", "min_md5", "max_md5"]:
-                                if f in parsed_res[method][col]:
-                                    final_json["methods"][method][col][f] = parsed_res[method][col][f]
+                if source_is_zero:
+                    final_json["count"] = 0
+
+                    sum_cols = sorted(set(cat_cols.get('SUM_MIN_MAX', []) + cat_cols.get('MANUAL_NUM', [])))
+                    min_max_cols = sorted(set(cat_cols.get('MIN_MAX', [])))
+                    md5_cols = sorted(set(cat_cols.get('MD5_MIN_MAX', [])))
+
+                    if sum_cols:
+                        final_json["methods"]["SUM_MIN_MAX"] = collections.OrderedDict()
+                        for col in sum_cols:
+                            final_json["methods"]["SUM_MIN_MAX"][col] = collections.OrderedDict()
+                            final_json["methods"]["SUM_MIN_MAX"][col]["data_type"] = type_map.get(col, "unknown")
+                            final_json["methods"]["SUM_MIN_MAX"][col]["sum"] = None
+                            final_json["methods"]["SUM_MIN_MAX"][col]["min"] = None
+                            final_json["methods"]["SUM_MIN_MAX"][col]["max"] = None
+
+                    if min_max_cols:
+                        final_json["methods"]["MIN_MAX"] = collections.OrderedDict()
+                        for col in min_max_cols:
+                            final_json["methods"]["MIN_MAX"][col] = collections.OrderedDict()
+                            final_json["methods"]["MIN_MAX"][col]["data_type"] = type_map.get(col, "unknown")
+                            final_json["methods"]["MIN_MAX"][col]["min"] = None
+                            final_json["methods"]["MIN_MAX"][col]["max"] = None
+
+                    if md5_cols:
+                        final_json["methods"]["MD5_MIN_MAX"] = collections.OrderedDict()
+                        for col in md5_cols:
+                            final_json["methods"]["MD5_MIN_MAX"][col] = collections.OrderedDict()
+                            final_json["methods"]["MD5_MIN_MAX"][col]["data_type"] = type_map.get(col, "unknown")
+                            final_json["methods"]["MD5_MIN_MAX"][col]["min_md5"] = None
+                            final_json["methods"]["MD5_MIN_MAX"][col]["max_md5"] = None
+                else:
+                    self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
+                    parquet_read_path = self._resolve_parquet_path(hdfs_dest)
+                    df = self.spark.read.parquet(parquet_read_path)
+                    self._log_reconcile_column_usage(partition, cat_cols, df.dtypes)
+
+                    self.worker_logger.info("Worker {0} executing Spark Action for {1}...".format(self.name, partition))
+
+                    agg_result = df.agg(*agg_exprs).collect()
+                    if not agg_result:
+                        raise RuntimeError("Spark aggregation returned empty result for {0}".format(partition))
+
+                    sp_row = agg_result[0]
+                    sp_res = sp_row.asDict()
+                    self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
+
+                    def format_val(v):
+                        if v is None: return None
+                        v_str = str(v)
+                        if 'E' in v_str or 'e' in v_str:
+                            try:
+                                return "{:f}".format(Decimal(v_str))
+                            except Exception:
+                                pass
+                        return v
+
+                    final_json["count"] = int(sp_res.pop("count", 0))
+
+                    parsed_res = {}
+                    for k, v in sp_res.items():
+                        parts = k.split('|')
+                        if len(parts) == 3:
+                            method, col, func = parts
+                            if method not in parsed_res: parsed_res[method] = {}
+                            if col not in parsed_res[method]: parsed_res[method][col] = {}
+                            parsed_res[method][col][func] = format_val(v)
+
+                    for method in ["SUM_MIN_MAX", "MIN_MAX", "MD5_MIN_MAX"]:
+                        if method in parsed_res:
+                            final_json["methods"][method] = collections.OrderedDict()
+                            for col in sorted(parsed_res[method].keys()):
+                                final_json["methods"][method][col] = collections.OrderedDict()
+                                final_json["methods"][method][col]["data_type"] = type_map.get(col, "unknown")
+                                for f in ["sum", "min", "max", "min_md5", "max_md5"]:
+                                    if f in parsed_res[method][col]:
+                                        final_json["methods"][method][col][f] = parsed_res[method][col][f]
 
                 # Step 5: Write to NAS
                 query_file_name = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, partition, self.global_ts)
@@ -1658,7 +1731,10 @@ class Worker(threading.Thread):
                 if copy_success and json_exists:
                     self.worker_logger.info("Worker {0} successfully saved and copied JSON to NAS for {1}".format(self.name, partition))
                     status = "SUCCESS"
-                    remark = "JSON Generated."
+                    if source_is_zero:
+                        remark = "JSON Generated (Source_Count=0; null-structured result)."
+                    else:
+                        remark = "JSON Generated."
                 else:
                     self.worker_logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2}".format(
                         self.name, partition, copy_err))
@@ -1906,6 +1982,20 @@ class UploadWorker(threading.Thread):
                 if not log_row:
                     raise ValueError(log_msg)
 
+                # Only new offloadgp_stat schema exists — read count from canonical field
+                source_count = parse_source_count(
+                    log_row.get('Greenplum_Num_Record', ''),
+                    self.worker_logger,
+                    "[{0}]".format(self.name)
+                )
+                if source_count == 0:
+                    hdfs_dest = "-"
+                    status = "SUCCESS"
+                    remark = "Source_Count=0. Blank table, skipped upload."
+                    self.worker_logger.info("[{0}] {1}".format(self.name, remark))
+                    self.tracker.add_result(partition, status, time.time() - start_t, remark)
+                    continue
+
                 local_file_path = log_row.get('File_Path', '').strip()
                 # Apply path substitution if the export host differs from the sync host
                 if self.config.replace_path_from and self.config.replace_path_to:
@@ -1915,6 +2005,10 @@ class UploadWorker(threading.Thread):
                     if original_path != local_file_path:
                         self.worker_logger.info("[{0}] Path replaced: '{1}' -> '{2}'".format(
                             self.name, original_path, local_file_path))
+
+                # Guard: fail fast if File_Path is absent from the offload log row
+                if not local_file_path:
+                    raise ValueError("FAILED: File_Path is empty in offload log for {0}. Cannot proceed with HDFS sync.".format(partition))
 
                 # Step 2: Sync to HDFS with per-worker log and dashboard progress callback
                 hdfs_dest = os.path.join(self.config.hdfs_path, db, schema, partition)
