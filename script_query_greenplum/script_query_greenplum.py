@@ -1049,7 +1049,7 @@ class Worker(threading.Thread):
                                             continue
                                         
                                         # match "column_name;logic"
-                                        m = re.match(r'^([a-zA-Z0-9_]+);(.*)', line)
+                                        m = re.match(r'^([^;]+);(.*)', line)
                                         if m:
                                             cur_col = m.group(1).strip().lower()
                                             insert_logic_dict[cur_col] = m.group(2)
@@ -1058,7 +1058,7 @@ class Worker(threading.Thread):
 
                                 for col in insert_logic_dict:
                                     logic = insert_logic_dict[col].replace('\\n', ' ').replace('\n', ' ')
-                                    insert_logic_dict[col] = re.sub(r'(?i)\s+AS\s+"?[a-zA-Z0-9_]+"?(?:\s*)$', '', logic).strip()
+                                    insert_logic_dict[col] = re.sub(r'(?i)\s+AS\s+(?:"[^"]+"|[a-zA-Z0-9_]+)(?:\s*)$', '', logic).strip()
 
                             # Categorize
                             cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': {}, 'MANUAL_NUM': master_info['manual_num']}

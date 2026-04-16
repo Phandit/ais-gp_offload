@@ -172,6 +172,7 @@ class ConfigManager(object):
         self.hive_status_table = ''
         self.hive_result_table = ''
         self.kinit_cmd = ''
+        self.nas_csv_path = ''
         
         self._load_env_config(args.env)
         self._log_configurations()
@@ -196,6 +197,7 @@ class ConfigManager(object):
                         elif key == 'hive_status_table': self.hive_status_table = val
                         elif key == 'hive_result_table': self.hive_result_table = val
                         elif key == 'hdfs_replication': self.hdfs_replication = int(val)
+                        elif key == 'nas_csv_path': self.nas_csv_path = val
         except Exception as e:
             self.logger.critical("Cannot read env config: {0}".format(e))
             err_msg = "Cannot read env config file: {0} | Error: {1}".format(env_path, e)
@@ -301,6 +303,7 @@ class ConfigManager(object):
         self.logger.info("HDFS Replication     : {0}".format(self.hdfs_replication))
         self.logger.info("Execution ID         : {0}".format(self.execution_id))
         self.logger.info("Log File Path        : {0}".format(self.log_path))
+        self.logger.info("NAS CSV Path         : {0}".format(self.nas_csv_path))
         self.logger.info("------------------------------")
 
 # ==============================================================================
@@ -321,10 +324,17 @@ class SucceededLogValidator(object):
         
         if cache_key not in self.cache[source]:
             self.cache[source][cache_key] = {}
-            pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_*.csv")
+            if source == 'gp':
+                pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_*.csv")
+            else:
+                pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_{0}_list_reconcile_pq*.csv".format(db))
+            self.logger.info("LogValidator [{0}]: Searching log files using pattern: {1}".format(source, pattern))
             matched_files = sorted(glob.glob(pattern), reverse=True)
 
-            self.logger.info("LogValidator [{0}]: Found {1} files for {2}.{3}".format(source, len(matched_files), db, schema))
+            if not matched_files:
+                self.logger.warning("LogValidator [{0}]: No log files found for {1}.{2} using pattern: {3}".format(source, db, schema, pattern))
+            else:
+                self.logger.info("LogValidator [{0}]: Found {1} files for {2}.{3}. Scanning from latest: {4}".format(source, len(matched_files), db, schema, matched_files[0]))
             
             for log_file in matched_files:
                 try:
@@ -366,6 +376,8 @@ class SucceededLogValidator(object):
         target_name_2 = "{0}.{1}".format(schema, partition).strip()
         target_name_3 = "{0}.{1}.{2}".format(db, schema, partition).strip()
 
+        self.logger.info("LogValidator: Searching cache for targets: 1)'{0}' 2)'{1}' 3)'{2}'".format(target_name_1, target_name_2, target_name_3))
+
         def find_row_in_cache(src):
             cache_dict = self.cache[src].get(cache_key, {})
             return cache_dict.get(target_name_1) or cache_dict.get(target_name_2) or cache_dict.get(target_name_3)
@@ -384,13 +396,14 @@ class SucceededLogValidator(object):
                 else:
                     gp_err = "Latest query greenplum status is {0}".format(row.get('run_status'))
             else:
-                gp_err = "Table not found in greenplum log"
+                gp_pattern = os.path.join(self.gp_log_path, "*", db, schema, "stat_csv", "log_stat_rc_*.csv")
+                gp_err = "Table not found in greenplum log (Searched CSV pattern: {0})".format(gp_pattern)
 
         if mode in ['compare', 'load_pq', 'load_both']:
             row = find_row_in_cache('pq')
             if row:
-                self.logger.info("LogValidator [PQ]: Latest record for '{0}' at '{1}' is method '{2}'".format(
-                    partition, row.get('end_timestamp'), row.get('reconcile_method')))
+                self.logger.info("LogValidator [PQ]: Latest record for '{0}' at '{1}' is method '{2}' [Source: {3}]".format(
+                    partition, row.get('end_timestamp'), row.get('reconcile_method'), row.get('source_file_path')))
                 
                 latest_method = row.get('reconcile_method', '')
                 latest_status = row.get('run_status', '')
@@ -404,7 +417,8 @@ class SucceededLogValidator(object):
                     pq_hdfs_path = row.get('hdfs_path', '').strip()
                     self.logger.info("LogValidator [PQ]: Identified HDFS_PATH '{0}' for '{1}'".format(pq_hdfs_path, partition))
             else:
-                pq_err = "Table not found in parquet log"
+                pq_pattern = os.path.join(self.pq_log_path, "*", db, schema, "stat_csv", "log_stat_rc_{0}_list_reconcile_pq*.csv".format(db))
+                pq_err = "Table not found in parquet log (Searched CSV pattern: {0})".format(pq_pattern)
 
         return gp_path, pq_path, pq_hdfs_path, gp_err, pq_err
     
@@ -676,9 +690,9 @@ class ReportWriter(object):
                        
         try:
             with open(self.header_csv, 'w') as f:
-                csv.DictWriter(f, fieldnames=self.h_cols).writeheader()
+                csv.DictWriter(f, fieldnames=self.h_cols, delimiter='|').writeheader()
             with open(self.detail_csv, 'w') as f:
-                csv.DictWriter(f, fieldnames=self.d_cols).writeheader()
+                csv.DictWriter(f, fieldnames=self.d_cols, delimiter='|').writeheader()
         except Exception as e:
             self.logger.critical("Failed to initialize Output CSV files. Path: {0}. Error: {1}".format(out_dir, e))
             raise Exception("ReportWriter Initialization Failed: {0}".format(e))
@@ -687,9 +701,9 @@ class ReportWriter(object):
         with self.lock:
             try:
                 with open(self.header_csv, 'a') as f:
-                    csv.DictWriter(f, fieldnames=self.h_cols).writerow(h_rec)
+                    csv.DictWriter(f, fieldnames=self.h_cols, delimiter='|').writerow(h_rec)
                 with open(self.detail_csv, 'a') as f:
-                    writer = csv.DictWriter(f, fieldnames=self.d_cols)
+                    writer = csv.DictWriter(f, fieldnames=self.d_cols, delimiter='|')
                     for rec in d_recs: writer.writerow(rec)
             except Exception as e:
                 self.logger.critical("ReportWriter Failed to write CSVs! Error: {0}".format(e), exc_info=True)
@@ -959,8 +973,9 @@ class ReconcileJob(object):
         self.logger = logger
         self.log_path = log_path
         self.global_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.global_date = self.global_ts.split('_')[0]
         self.job_start_time = datetime.now()
-        self.out_dir = os.path.join(main_path, 'output', datetime.now().strftime("%Y%m%d"))
+        self.out_dir = os.path.join(main_path, 'output', self.global_date)
         try:
             if not os.path.exists(self.out_dir): os.makedirs(self.out_dir)
         except Exception as e:
@@ -971,6 +986,7 @@ class ReconcileJob(object):
         self.execution_id = "JOB_{0}_{1}".format(self.global_ts, short_uuid)
 
         self.config = ConfigManager(args, logger, self.execution_id, self.log_path)
+        self.target_db = self.config.execution_list[0]['db'] if self.config.execution_list else 'unknown_db'
         
         if hasattr(self.config, 'kinit_cmd') and self.config.kinit_cmd:
             self._authenticate_kerberos()
@@ -1045,6 +1061,39 @@ class ReconcileJob(object):
             monitor.stop()
             monitor.join()
             self.tracker.print_summary(self.log_path, self.out_dir)
+            self._copy_csv_to_nas()
+
+    def _copy_csv_to_nas(self):
+        if not getattr(self.config, 'nas_csv_path', None):
+            self.logger.info("nas_csv_path is not defined in env_config. Skipping NAS copy.")
+            return
+
+        import shutil
+        dest_dir = os.path.join(self.config.nas_csv_path, self.target_db, self.global_date)
+
+        try:
+            if not os.path.exists(dest_dir):
+                os.makedirs(dest_dir)
+
+            header_dest = os.path.join(dest_dir, os.path.basename(self.report_writer.header_csv))
+            detail_dest = os.path.join(dest_dir, os.path.basename(self.report_writer.detail_csv))
+
+            shutil.copy2(self.report_writer.header_csv, header_dest)
+            shutil.copy2(self.report_writer.detail_csv, detail_dest)
+
+            self.logger.info("Successfully copied CSV files to NAS: {0}".format(dest_dir))
+            print("============================================================")
+            print(" NAS Copy Successful:")
+            print(" Header : {0}".format(header_dest))
+            print(" Detail : {0}".format(detail_dest))
+            print("============================================================\n")
+        except Exception as e:
+            self.logger.error("Failed to copy CSV files to NAS. Error: {0}".format(e), exc_info=True)
+            print("\n============================================================")
+            print(" [ERROR] Failed to copy CSV files to NAS")
+            print(" Destination : {0}".format(dest_dir))
+            print(" Error       : {0}".format(e))
+            print("============================================================\n")
 
 # ==============================================================================
 # Main Entry Point
