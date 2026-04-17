@@ -654,6 +654,7 @@ class QueryBuilder(object):
             # Construct single JSON object string
             if ctas_table:
                 sql = (
+                    "SET max_stack_depth = '6MB';"
                     "SELECT '{{' || "
                     " '\"table\": \"{0}\", ' || "
                     " '\"source_type\": \"greenplum\", ' || "
@@ -664,6 +665,7 @@ class QueryBuilder(object):
                 ).format(full_table_name, metrics_sql, ctas_schema, ctas_table)
             else:
                 sql = (
+                    "SET max_stack_depth = '6MB';"
                     "SELECT '{{' || "
                     " '\"table\": \"{0}\", ' || "
                     " '\"source_type\": \"greenplum\", ' || "
