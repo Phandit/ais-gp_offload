@@ -654,23 +654,25 @@ class QueryBuilder(object):
             # Construct single JSON object string
             if ctas_table:
                 sql = (
+                    "SET max_stack_depth = '6MB';"
                     "SELECT '{{' || "
                     " '\"table\": \"{0}\", ' || "
                     " '\"source_type\": \"greenplum\", ' || "
                     " '\"count\": ' || COUNT(*)::text || ', ' || "
                     " '\"methods\": {{' || {1} || '}}' || "
                     " '}}' "
-                    "FROM \"{2}\".\"{3}\";"
+                    "FROM ONLY \"{2}\".\"{3}\";"
                 ).format(full_table_name, metrics_sql, ctas_schema, ctas_table)
             else:
                 sql = (
+                    "SET max_stack_depth = '6MB';"
                     "SELECT '{{' || "
                     " '\"table\": \"{0}\", ' || "
                     " '\"source_type\": \"greenplum\", ' || "
                     " '\"count\": ' || COUNT(*)::text || ', ' || "
                     " '\"methods\": {{' || {1} || '}}' || "
                     " '}}' "
-                    "FROM \"{2}\".\"{3}\";"
+                    "FROM ONLY \"{2}\".\"{3}\";"
                 ).format(full_table_name, metrics_sql, schema, table)
 
             filename = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, table, self.global_ts)
