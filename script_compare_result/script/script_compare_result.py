@@ -137,10 +137,10 @@ class MonitorThread(threading.Thread):
         sys.stdout.write(output)
         sys.stdout.flush()
 
-def setup_logging(log_dir, log_name="app", timestamp=None):
+def setup_logging(log_dir, log_name, ts, short_id):
     try:
         if not os.path.exists(log_dir): os.makedirs(log_dir)
-        log_file = os.path.join(log_dir, "{0}_{1}.log".format(log_name, timestamp))
+        log_file = os.path.join(log_dir, "{0}_{1}_{2}.log".format(log_name, ts, short_id))
         logger = logging.getLogger("CompareJob")
         logger.setLevel(logging.INFO)
         logger.handlers = []
@@ -149,7 +149,7 @@ def setup_logging(log_dir, log_name="app", timestamp=None):
         logger.addHandler(fh)
         return logger, log_file
     except Exception as e:
-        print("CRITICAL ERROR: Cannot create log directory or file. Permission denied or disk full? Error: {0}".format(e))
+        print("CRITICAL ERROR: Cannot create log directory or file. Error: {0}".format(e))
         sys.exit(1)
 
 # ==============================================================================
@@ -357,8 +357,8 @@ class SucceededLogValidator(object):
                                     row['hdfs_path'] = row.get('hdfs_path', '').strip()
                                     row['source_file_path'] = log_file
                                     self.cache[source][cache_key][tbl] = row
-                                    if row['hdfs_path']:
-                                        self.logger.info("LogValidator [{0}]: Extracted hdfs_path '{1}' for '{2}'".format(source, row['hdfs_path'], tbl))
+                                    #if row['hdfs_path'] and row['hdfs_path'].lower() not in ('-', 'none', 'null'):
+                                    #    self.logger.info("LogValidator [{0}]: Extracted hdfs_path '{1}' for '{2}'".format(source, row['hdfs_path'], tbl))
                 except Exception as e:
                     self.logger.warning("Error reading log file {0}: {1}".format(log_file, e))
                     continue
@@ -675,10 +675,10 @@ class ResultDataHandler(object):
 # ==============================================================================
 
 class ReportWriter(object):
-    def __init__(self, out_dir, global_ts, logger):
+    def __init__(self, out_dir, ts, short_id, nas_path, target_db, logger):
         self.logger = logger
-        self.header_csv = os.path.join(out_dir, "Compare_Header_Result_{0}.csv".format(global_ts))
-        self.detail_csv = os.path.join(out_dir, "Compare_Detail_Result_{0}.csv".format(global_ts))
+        self.header_csv = os.path.join(out_dir, "Compare_Header_Result_{0}_{1}.csv".format(ts, short_id))
+        self.detail_csv = os.path.join(out_dir, "Compare_Detail_Result_{0}_{1}.csv".format(ts, short_id))
         self.lock = threading.Lock()
         
         self.h_cols = ['table_name', 'gp_count_record', 'pq_count_record', 'gp_count_sum_min_max_col', 'pq_count_sum_min_max_col',
@@ -687,27 +687,140 @@ class ReportWriter(object):
                        'start_ts', 'end_ts', 'execution_id', 'remark']
         self.d_cols = ['table_name', 'col_nm', 'data_type', 'method', 'gp_sum', 'gp_min', 'gp_max', 'pq_sum', 'pq_min', 'pq_max',
                        'reconcile_result', 'execution_id', 'remark']
-                       
+        
+        self.nas_header_csv = None
+        self.nas_detail_csv = None
+        if nas_path and target_db:
+            global_date = ts.split('_')[0]
+            dest_dir = os.path.join(nas_path, target_db, global_date)
+            if not os.path.exists(dest_dir):
+                try:
+                    os.makedirs(dest_dir)
+                except Exception as e:
+                    self.logger.warning("Could not create NAS directory {0}. Error: {1}".format(dest_dir, e))
+            
+            if os.path.exists(dest_dir):
+                self.nas_header_csv = os.path.join(dest_dir, os.path.basename(self.header_csv))
+                self.nas_detail_csv = os.path.join(dest_dir, os.path.basename(self.detail_csv))
+
         try:
             with open(self.header_csv, 'w') as f:
                 csv.DictWriter(f, fieldnames=self.h_cols, delimiter='|').writeheader()
             with open(self.detail_csv, 'w') as f:
                 csv.DictWriter(f, fieldnames=self.d_cols, delimiter='|').writeheader()
+            
+            if self.nas_header_csv and not os.path.exists(self.nas_header_csv):
+                with open(self.nas_header_csv, 'w') as f:
+                    csv.DictWriter(f, fieldnames=self.h_cols, delimiter='|').writeheader()
+            if self.nas_detail_csv and not os.path.exists(self.nas_detail_csv):
+                with open(self.nas_detail_csv, 'w') as f:
+                    csv.DictWriter(f, fieldnames=self.d_cols, delimiter='|').writeheader()
         except Exception as e:
             self.logger.critical("Failed to initialize Output CSV files. Path: {0}. Error: {1}".format(out_dir, e))
             raise Exception("ReportWriter Initialization Failed: {0}".format(e))
 
     def append_results(self, h_rec, d_recs):
+        import StringIO
+        
+        h_io = StringIO.StringIO()
+        csv.DictWriter(h_io, fieldnames=self.h_cols, delimiter='|').writerow(h_rec)
+        h_str = h_io.getvalue()
+        h_io.close()
+
+        d_str = ""
+        if d_recs:
+            d_io = StringIO.StringIO()
+            d_writer = csv.DictWriter(d_io, fieldnames=self.d_cols, delimiter='|')
+            for rec in d_recs: 
+                d_writer.writerow(rec)
+            d_str = d_io.getvalue()
+            d_io.close()
         with self.lock:
             try:
+                # Write Local
                 with open(self.header_csv, 'a') as f:
-                    csv.DictWriter(f, fieldnames=self.h_cols, delimiter='|').writerow(h_rec)
+                    f.write(h_str)
                 with open(self.detail_csv, 'a') as f:
-                    writer = csv.DictWriter(f, fieldnames=self.d_cols, delimiter='|')
-                    for rec in d_recs: writer.writerow(rec)
+                    f.write(d_str)
+                    
+                # // ADDED: Write NAS real-time
+                if self.nas_header_csv:
+                    with open(self.nas_header_csv, 'a') as f:
+                        f.write(h_str)
+                if self.nas_detail_csv:
+                    with open(self.nas_detail_csv, 'a') as f:
+                        f.write(d_str)
             except Exception as e:
                 self.logger.critical("ReportWriter Failed to write CSVs! Error: {0}".format(e), exc_info=True)
                 raise
+
+class HdfsCsvHandler(object):
+    def __init__(self, local_temp_dir, hdfs_status, hdfs_result, logger):
+        self.local_temp_dir = local_temp_dir
+        self.hdfs_status = hdfs_status
+        self.hdfs_result = hdfs_result
+        self.logger = logger
+        
+        try:
+            if not os.path.exists(self.local_temp_dir):
+                os.makedirs(self.local_temp_dir)
+        except Exception as e:
+            self.logger.critical("Cannot create local temp csv directory. Error: {0}".format(e))
+            raise Exception("HdfsCsvHandler Initialization Failed")
+
+    def log_results(self, h_rec, d_recs, worker=None):
+        if not self.hdfs_status or not self.hdfs_result: 
+            return
+        
+        def _write_log(level, msg, exc_info=False):
+            if worker and hasattr(worker, '_log'):
+                worker._log(level, msg, exc_info)
+            else:
+                if level == 'INFO': self.logger.info(msg)
+                elif level == 'WARNING': self.logger.warning(msg)
+                elif level == 'ERROR': self.logger.error(msg, exc_info=exc_info)
+
+        h_cols = ['table_name', 'gp_count_record', 'pq_count_record', 'gp_count_sum_min_max_col', 'pq_count_sum_min_max_col',
+                   'gp_count_min_max_col', 'pq_count_min_max_col', 'gp_count_md5_min_max_col', 'pq_count_md5_min_max_col',
+                   'gp_total_recon_col', 'pq_total_recon_col', 'reconcile_status', 'gp_json_file', 'pq_json_file', 
+                   'start_ts', 'end_ts', 'execution_id', 'remark']
+        d_cols = ['table_name', 'col_nm', 'data_type', 'method', 'gp_sum', 'gp_min', 'gp_max', 'pq_sum', 'pq_min', 'pq_max',
+                   'reconcile_result', 'execution_id', 'remark']
+
+        file_uuid = str(uuid.uuid4())
+        target_file = "part_{0}.csv".format(file_uuid)
+        
+        local_status_file = os.path.join(self.local_temp_dir, "status_" + target_file)
+        local_result_file = os.path.join(self.local_temp_dir, "result_" + target_file)
+        
+        try:
+            with open(local_status_file, 'w') as f:
+                csv.DictWriter(f, fieldnames=h_cols, delimiter='|').writerow(h_rec)
+                
+            if d_recs:
+                with open(local_result_file, 'w') as f:
+                    writer = csv.DictWriter(f, fieldnames=d_cols, delimiter='|')
+                    for rec in d_recs: writer.writerow(rec)
+
+            _write_log('INFO', "Step 6: Moving CSV files to HDFS for table: {0}".format(h_rec.get('table_name')))
+            
+            hdfs_cmd_status = "hdfs dfs -moveFromLocal {0} {1}/{2}".format(local_status_file, self.hdfs_status, target_file)
+            subprocess.check_output(hdfs_cmd_status, shell=True, stderr=subprocess.STDOUT)
+
+            if d_recs:
+                hdfs_cmd_result = "hdfs dfs -moveFromLocal {0} {1}/{2}".format(local_result_file, self.hdfs_result, target_file)
+                subprocess.check_output(hdfs_cmd_result, shell=True, stderr=subprocess.STDOUT)
+
+            _write_log('INFO', "Step 7: Successfully moved CSV to HDFS for: {0}".format(h_rec.get('table_name')))
+            
+        except subprocess.CalledProcessError as e:
+            actual_error = e.output.decode('utf-8', errors='ignore') if hasattr(e, 'output') and e.output else "No output"
+            _write_log('WARNING', "Failed to move CSV to HDFS for {0}. HDFS Error: {1}".format(h_rec.get('table_name'), actual_error))
+        except Exception as e:
+            _write_log('ERROR', "Unexpected error in HdfsCsvHandler for {0}: {1}".format(h_rec.get('table_name'), e), exc_info=True)
+        finally:
+            if os.path.exists(local_status_file): os.remove(local_status_file)
+            if os.path.exists(local_result_file): os.remove(local_result_file)
     
 class VenvParquetHandler(object):
     def __init__(self, activate_cmd, writer_script_path, local_status, local_result, hdfs_status, hdfs_result, logger):
@@ -744,50 +857,49 @@ class VenvParquetHandler(object):
         payload = {'status': h_rec, 'result': d_recs}
         fd, temp_json_path = tempfile.mkstemp(suffix='.json')
         
-        with self.lock:
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(payload, f)
+
+            cmd_string = "{0} && python {1} {2} {3} {4}".format(
+                self.activate_cmd, 
+                self.writer_script, 
+                temp_json_path, 
+                self.local_status, 
+                self.local_result
+            )
+
+            _write_log('INFO', "Step 6: Calling Anaconda to write Parquet for table: {0}".format(h_rec.get('table_name')))
+            output = subprocess.check_output(cmd_string, shell=True, executable='/bin/bash', stderr=subprocess.STDOUT)
+            _write_log('INFO', "Step 7: Successfully wrote parquet files via Anaconda for: {0}. Output: {1}".format(h_rec.get('table_name'), output.strip()))
+
+            file_uuid = output.strip().decode('utf-8') 
+            target_file = "part_{0}.parquet".format(file_uuid)
+
             try:
-                with os.fdopen(fd, 'w') as f:
-                    json.dump(payload, f)
+                hdfs_cmd_status = "hdfs dfs -moveFromLocal {0}/{1} {2}/".format(self.local_status, target_file, self.hdfs_status)
+                status_out = subprocess.check_output(hdfs_cmd_status, shell=True, stderr=subprocess.STDOUT)
 
-                cmd_string = "{0} && python {1} {2} {3} {4}".format(
-                    self.activate_cmd, 
-                    self.writer_script, 
-                    temp_json_path, 
-                    self.local_status, 
-                    self.local_result
-                )
+                if d_recs:
+                    hdfs_cmd_result = "hdfs dfs -moveFromLocal {0}/{1} {2}/".format(self.local_result, target_file, self.hdfs_result)
+                    result_out = subprocess.check_output(hdfs_cmd_result, shell=True, stderr=subprocess.STDOUT)
 
-                _write_log('INFO', "Step 6: Calling Anaconda to write Parquet for table: {0}".format(h_rec.get('table_name')))
-                output = subprocess.check_output(cmd_string, shell=True, executable='/bin/bash', stderr=subprocess.STDOUT)
-                _write_log('INFO', "Step 7: Successfully wrote parquet files via Anaconda for: {0}. Output: {1}".format(h_rec.get('table_name'), output.strip()))
-
-                file_uuid = output.strip().decode('utf-8') 
-                target_file = "part_{0}.parquet".format(file_uuid)
-
-                try:
-                    hdfs_cmd_status = "hdfs dfs -moveFromLocal {0}/{1} {2}/".format(self.local_status, target_file, self.hdfs_status)
-                    status_out = subprocess.check_output(hdfs_cmd_status, shell=True, stderr=subprocess.STDOUT)
-
-                    if d_recs:
-                        hdfs_cmd_result = "hdfs dfs -moveFromLocal {0}/{1} {2}/".format(self.local_result, target_file, self.hdfs_result)
-                        result_out = subprocess.check_output(hdfs_cmd_result, shell=True, stderr=subprocess.STDOUT)
-
-                    _write_log('INFO', "Step 8: Successfully moved Parquet to HDFS for: {0}".format(h_rec.get('table_name')))
-                except subprocess.CalledProcessError as e:
-                    actual_error = e.output.decode('utf-8', errors='ignore') if e.output else "No output"
-                    _write_log('WARNING', "Failed to move Parquet to HDFS for {0}. HDFS Error: {1}".format(h_rec.get('table_name'), actual_error))
-                except Exception as e:
-                    _write_log('WARNING', "Failed to move Parquet to HDFS for {0}: {1}".format(h_rec.get('table_name'), e))
-
+                _write_log('INFO', "Step 8: Successfully moved Parquet to HDFS for: {0}".format(h_rec.get('table_name')))
             except subprocess.CalledProcessError as e:
-                actual_error_msg = e.output.decode('utf-8', errors='ignore') if hasattr(e, 'output') and e.output else "No additional error output."
-                _write_log('ERROR', "Anaconda Parquet write failed for {0}. Subprocess Exit Code: {1}\n>> ACTUAL ERROR DETAILS:\n{2}".format(
-                    h_rec.get('table_name'), e.returncode, actual_error_msg))
+                actual_error = e.output.decode('utf-8', errors='ignore') if e.output else "No output"
+                _write_log('WARNING', "Failed to move Parquet to HDFS for {0}. HDFS Error: {1}".format(h_rec.get('table_name'), actual_error))
             except Exception as e:
-                _write_log('ERROR', "Unexpected error in VenvParquetHandler for {0}: {1}".format(h_rec.get('table_name'), e), exc_info=True)
-            finally:
-                if os.path.exists(temp_json_path):
-                    os.remove(temp_json_path)
+                _write_log('WARNING', "Failed to move Parquet to HDFS for {0}: {1}".format(h_rec.get('table_name'), e))
+
+        except subprocess.CalledProcessError as e:
+            actual_error_msg = e.output.decode('utf-8', errors='ignore') if hasattr(e, 'output') and e.output else "No additional error output."
+            _write_log('ERROR', "Anaconda Parquet write failed for {0}. Subprocess Exit Code: {1}\n>> ACTUAL ERROR DETAILS:\n{2}".format(
+                h_rec.get('table_name'), e.returncode, actual_error_msg))
+        except Exception as e:
+            _write_log('ERROR', "Unexpected error in VenvParquetHandler for {0}: {1}".format(h_rec.get('table_name'), e), exc_info=True)
+        finally:
+            if os.path.exists(temp_json_path):
+                os.remove(temp_json_path)
 
 # ==============================================================================
 # 5. Worker & Orchestration
@@ -795,7 +907,7 @@ class VenvParquetHandler(object):
 
 class Worker(threading.Thread):
     def __init__(self, thread_id, job_queue, config, log_validator, json_handler, 
-                 reconcile_engine, data_handler, report_writer, hive_handler, 
+                 reconcile_engine, data_handler, report_writer, 
                  tracker, execution_id, logger):
         threading.Thread.__init__(self)
         self.name = "Worker-{0:02d}".format(thread_id)
@@ -806,7 +918,6 @@ class Worker(threading.Thread):
         self.reconcile_engine = reconcile_engine
         self.data_handler = data_handler
         self.report_writer = report_writer
-        self.hive_handler = hive_handler
         self.tracker = tracker
         self.execution_id = execution_id
         self.logger = logger
@@ -814,7 +925,7 @@ class Worker(threading.Thread):
         self.log_buffer = []
 
     def _log(self, level, msg, exc_info=False):
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')
         formatted_msg = "{0} [{1}] {2}".format(ts, self.name, msg)
         self.log_buffer.append({'level': level, 'msg': formatted_msg, 'exc_info': exc_info})
 
@@ -884,7 +995,7 @@ class Worker(threading.Thread):
                             
                             # Logic to handle empty hdfs_path when PASSED
                             if raw_res.get('status') == 'PASSED':
-                                if pq_hdfs_p:
+                                if pq_hdfs_p and pq_hdfs_p.lower() not in ('-', 'none', 'null'):
                                     rep_num = getattr(self.config, 'hdfs_replication', 1)
                                     # Command structured with '&' for Non-blocking background execution
                                     cmd_setrep = "hdfs dfs -setrep -R {0} {1} &".format(rep_num, pq_hdfs_p)
@@ -892,14 +1003,14 @@ class Worker(threading.Thread):
                                     
                                     try:
                                         subprocess.Popen(cmd_setrep, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
-                                        raw_res['remark'] = "{0} | HDFS Setrep: Triggered".format(raw_res['remark'])
+                                        raw_res['remark'] = "{0} ~ HDFS Setrep: Triggered".format(raw_res['remark'])
                                     except Exception as e:
                                         self._log('WARNING', "Failed to trigger HDFS setrep for {0}: {1}".format(pq_hdfs_p, e))
-                                        raw_res['remark'] = "{0} | HDFS Setrep Failed: {1}".format(raw_res['remark'], e)
+                                        raw_res['remark'] = "{0} ~ HDFS Setrep Failed: {1}".format(raw_res['remark'], e)
                                 else:
                                     warn_msg = "Condition for setrep met (PASSED), but HDFS_PATH from CSV is EMPTY/NULL. Skipping setrep."
                                     self._log('WARNING', warn_msg)
-                                    raw_res['remark'] = "{0} | HDFS Setrep: Skipped (Empty Path)".format(raw_res['remark'])
+                                    raw_res['remark'] = "{0} ~ HDFS Setrep: Skipped (Empty Path)".format(raw_res['remark'])
                                     
                         elif self.config.mode in ['load_gp', 'load_pq', 'load_both']:
                             raw_res = self._build_load_mock(gp_data, pq_data)
@@ -912,10 +1023,8 @@ class Worker(threading.Thread):
                 )
 
                 # 5. Write Outputs
-                self._log('INFO', "Step 5: Writing Outputs to CSV and Hive")
+                self._log('INFO', "Step 5: Writing Outputs to Local CSV and NAS")
                 self.report_writer.append_results(h_rec, d_recs)
-                if self.hive_handler:
-                    self.hive_handler.log_results(h_rec, d_recs, self)
 
                 end_datetime = datetime.now()
                 end_ts_str = end_datetime.strftime('%Y-%m-%d %H:%M:%S')
@@ -968,13 +1077,14 @@ class Worker(threading.Thread):
         return res
 
 class ReconcileJob(object):
-    def __init__(self, args, logger, log_path, main_path):
+    def __init__(self, args, logger, log_path, main_path, ts, short_id):
         self.args = args
         self.logger = logger
         self.log_path = log_path
-        self.global_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.global_ts = ts
         self.global_date = self.global_ts.split('_')[0]
         self.job_start_time = datetime.now()
+        self.execution_id = "JOB_{0}_{1}".format(self.global_ts, short_id)
         self.out_dir = os.path.join(main_path, 'output', self.global_date)
         try:
             if not os.path.exists(self.out_dir): os.makedirs(self.out_dir)
@@ -1000,22 +1110,31 @@ class ReconcileJob(object):
         self.json_handler = JsonHandler(self.config.replace_path_from, self.config.replace_path_to, logger)
         self.reconcile_engine = ReconcileMain(logger)
         self.data_handler = ResultDataHandler(logger)
-        self.report_writer = ReportWriter(self.out_dir, self.global_ts, logger)
+        self.report_writer = ReportWriter(self.out_dir, self.global_ts, short_id, getattr(self.config, 'nas_csv_path', None), self.target_db, logger)
 
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
         writer_script = os.path.join(current_script_dir, "parquet_writer.py")
         local_temp_status = os.path.join(self.out_dir, "temp_parquet", "status")
         local_temp_result = os.path.join(self.out_dir, "temp_parquet", "result")
 
-        self.hive_handler = VenvParquetHandler(
-            self.config.conda_activate_cmd,
-            writer_script,
-            local_temp_status,
-            local_temp_result,
-            self.config.hive_status_table,
-            self.config.hive_result_table,
-            logger
-        )
+        # // REMARK: VenvParquetHandler is kept for legacy but no longer passed to Worker
+        #self.hive_handler = VenvParquetHandler(
+        #    self.config.conda_activate_cmd,
+        #    writer_script,
+        #    local_temp_status,
+        #    local_temp_result,
+        #    self.config.hive_status_table,
+        #    self.config.hive_result_table,
+        #    logger
+        #)
+
+        local_temp_csv = os.path.join(self.out_dir, "temp_csv")
+        # self.hdfs_csv_handler = HdfsCsvHandler(
+        #     local_temp_csv,
+        #     self.config.hive_status_table,  # This should now point to CSV HDFS path in config
+        #     self.config.hive_result_table,  # This should now point to CSV HDFS path in config
+        #     logger
+        # )
 
         self.job_queue = Queue.Queue()
         for task in self.config.execution_list: self.job_queue.put(task)
@@ -1044,7 +1163,7 @@ class ReconcileJob(object):
         for i in range(num_workers):
             w = Worker(i+1, self.job_queue, self.config, self.log_validator, self.json_handler, 
                        self.reconcile_engine, self.data_handler, self.report_writer, 
-                       self.hive_handler, self.tracker, self.execution_id, self.logger)
+                       self.tracker, self.execution_id, self.logger)
             workers.append(w)
             w.job_start_time = self.job_start_time
             w.start()
@@ -1061,7 +1180,7 @@ class ReconcileJob(object):
             monitor.stop()
             monitor.join()
             self.tracker.print_summary(self.log_path, self.out_dir)
-            self._copy_csv_to_nas()
+            self._put_csv_to_hdfs()
 
     def _copy_csv_to_nas(self):
         if not getattr(self.config, 'nas_csv_path', None):
@@ -1095,10 +1214,52 @@ class ReconcileJob(object):
             print(" Error       : {0}".format(e))
             print("============================================================\n")
 
+    def _put_csv_to_hdfs(self):
+        hdfs_status = getattr(self.config, 'hive_status_table', None)
+        hdfs_result = getattr(self.config, 'hive_result_table', None)
+        
+        if not hdfs_status or not hdfs_result:
+            self.logger.warning("HDFS paths not configured. Skipping batch HDFS upload.")
+            return
+            
+        file_uuid = str(uuid.uuid4())
+        local_header = self.report_writer.header_csv
+        local_detail = self.report_writer.detail_csv
+        
+        self.logger.info("Starting Batch HDFS Upload...")
+        print("\n============================================================")
+        print(" [INFO] Uploading Final CSVs to HDFS (Stripping Headers...)")
+        print("============================================================\n")
+
+        try:
+            if os.path.exists(local_header):
+                target_status = "{0}/part_status_{1}.csv".format(hdfs_status.rstrip('/'), file_uuid)
+                cmd_status = 'tail -n +2 "{0}" | hdfs dfs -put - "{1}"'.format(local_header, target_status)
+                self.logger.info("Executing HDFS PUT: {0}".format(cmd_status))
+                subprocess.check_output(cmd_status, shell=True, stderr=subprocess.STDOUT)
+                self.logger.info("Successfully uploaded Header CSV to HDFS.")
+
+            if os.path.exists(local_detail):
+                target_result = "{0}/part_result_{1}.csv".format(hdfs_result.rstrip('/'), file_uuid)
+                cmd_result = 'tail -n +2 "{0}" | hdfs dfs -put - "{1}"'.format(local_detail, target_result)
+                self.logger.info("Executing HDFS PUT: {0}".format(cmd_result))
+                subprocess.check_output(cmd_result, shell=True, stderr=subprocess.STDOUT)
+                self.logger.info("Successfully uploaded Detail CSV to HDFS.")
+                
+        except subprocess.CalledProcessError as e:
+            err_msg = e.output.decode('utf-8', errors='ignore') if hasattr(e, 'output') and e.output else str(e)
+            self.logger.error("Failed to upload CSV to HDFS. Error: {0}".format(err_msg))
+            print(" [ERROR] HDFS Upload Failed: {0}".format(err_msg))
+        except Exception as e:
+            self.logger.error("Unexpected error during HDFS upload: {0}".format(e), exc_info=True)
+
 # ==============================================================================
 # Main Entry Point
 # ==============================================================================
 if __name__ == "__main__":
+    global_date = datetime.now().strftime("%Y%m%d")
+    global_ts_ms = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    short_uuid = str(uuid.uuid4()).split('-')[0]
     current_script_dir = os.path.dirname(os.path.abspath(__file__))
     main_path = os.path.dirname(current_script_dir)
 
@@ -1133,10 +1294,10 @@ if __name__ == "__main__":
     global_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = os.path.join(main_path, 'log', global_date)
 
-    logger, log_path = setup_logging(log_dir, 'reconcile_compare', global_ts)
+    logger, log_path = setup_logging(log_dir, 'reconcile_compare', global_ts_ms, short_uuid)
 
     try:
-        job = ReconcileJob(args, logger, log_path, main_path)
+        job = ReconcileJob(args, logger, log_path, main_path, global_ts_ms, short_uuid)
         job.run()
     except Exception as e:
         logger.critical("Job aborted: {0}".format(e), exc_info=True)
