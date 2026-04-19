@@ -327,7 +327,7 @@ class SucceededLogValidator(object):
             if source == 'gp':
                 pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_*.csv")
             else:
-                pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_{0}_list_reconcile_pq*.csv".format(db))
+                pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_*.csv")
             self.logger.info("LogValidator [{0}]: Searching log files using pattern: {1}".format(source, pattern))
             import re
             def extract_ts(fname):
